@@ -28,19 +28,26 @@
 //   HEAT2D_ENABLE_RECOMPUTE   (default 1)
 //   HEAT2D_COST_PREDICT       (default 2.0)
 //   HEAT2D_COST_RECOMPUTE     (default 6.0)
-//   HEAT2D_COST_WAIT          (default 1000.0)
+//   HEAT2D_COST_WAIT          (default 1000.0; fallback antes do modelo online)
+//   HEAT2D_COST_MODEL         (default 1)
+//   HEAT2D_COST_BOOTSTRAP_SAMPLES (default 8, por thread)
+//   HEAT2D_COST_RESAMPLE_PERIOD   (default 1024 oportunidades; 0 desabilita)
+//   HEAT2D_COST_EWMA_BETA         (default 0.05)
+//   HEAT2D_COST_PREDICT_MARGIN    (default 1.0)
 //   HEAT2D_MAX_LEAD           (default 2; nesta versao deve ser 2)
 //   HEAT2D_DELAY_TID          (default -1; desabilitado)
 //   HEAT2D_DELAY_US           (default 0)
 //   HEAT2D_BUDGET_FLOOR       (default 1e-30)
 //
-// Observacao: o modelo de custos acima e intencionalmente simples nesta
-// primeira versao experimental. Ele serve para exercitar a escolha entre
-// PREDICT, RECOMPUTE e WAIT; pode ser substituido depois por um modelo medido.
+// Os custos P/R acima sao usados apenas como fallback enquanto o modelo online
+// ainda nao possui amostras suficientes. Depois do bootstrap, a decisao entre
+// tentar PREDICT e ir diretamente para RECOMPUTE usa custos medidos na propria
+// execucao, mais a probabilidade observada de a prediction ser admissivel.
 
 #include "heat2d_explicit_common.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -66,8 +73,34 @@ static_assert(HEAT2D_PROFILE_STATS == 0 || HEAT2D_PROFILE_STATS == 1,
 #if defined(__x86_64__) || defined(__i386__)
   #include <immintrin.h>
   static inline void spin_pause() noexcept { _mm_pause(); }
+
+  static inline std::uint64_t cost_ticks_begin() noexcept {
+      _mm_lfence();
+      return __rdtsc();
+  }
+
+  static inline std::uint64_t cost_ticks_end() noexcept {
+      unsigned aux = 0;
+      const std::uint64_t t = __rdtscp(&aux);
+      _mm_lfence();
+      return t;
+  }
+
+  static constexpr const char* COST_TICK_UNIT = "cycles";
 #else
   static inline void spin_pause() noexcept { std::this_thread::yield(); }
+
+  static inline std::uint64_t cost_ticks_begin() noexcept {
+      return static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count());
+  }
+
+  static inline std::uint64_t cost_ticks_end() noexcept {
+      return cost_ticks_begin();
+  }
+
+  static constexpr const char* COST_TICK_UNIT = "ns";
 #endif
 
 namespace adaptive {
@@ -120,6 +153,13 @@ struct Config {
     double cost_predict = 2.0;
     double cost_recompute = 6.0;
     double cost_wait = 1000.0;
+
+    bool enable_cost_model = true;
+    int cost_bootstrap_samples = 8;
+    int cost_resample_period = 1024;
+    double cost_ewma_beta = 0.05;
+    double cost_predict_margin = 1.0;
+
     int max_lead = 2;
     int delay_tid = -1;
     int delay_us = 0;
@@ -134,12 +174,33 @@ struct Config {
         c.cost_predict = getenv_double("HEAT2D_COST_PREDICT", c.cost_predict);
         c.cost_recompute = getenv_double("HEAT2D_COST_RECOMPUTE", c.cost_recompute);
         c.cost_wait = getenv_double("HEAT2D_COST_WAIT", c.cost_wait);
+
+        c.enable_cost_model =
+            getenv_int("HEAT2D_COST_MODEL", c.enable_cost_model ? 1 : 0) != 0;
+        c.cost_bootstrap_samples =
+            getenv_int("HEAT2D_COST_BOOTSTRAP_SAMPLES", c.cost_bootstrap_samples);
+        c.cost_resample_period =
+            getenv_int("HEAT2D_COST_RESAMPLE_PERIOD", c.cost_resample_period);
+        c.cost_ewma_beta =
+            getenv_double("HEAT2D_COST_EWMA_BETA", c.cost_ewma_beta);
+        c.cost_predict_margin =
+            getenv_double("HEAT2D_COST_PREDICT_MARGIN", c.cost_predict_margin);
+
         c.max_lead = getenv_int("HEAT2D_MAX_LEAD", c.max_lead);
         c.delay_tid = getenv_int("HEAT2D_DELAY_TID", c.delay_tid);
         c.delay_us = getenv_int("HEAT2D_DELAY_US", c.delay_us);
         if (c.eta < 0.0) c.eta = 0.0;
         if (c.kappa <= 0.0) c.kappa = 1.0;
         if (c.budget_floor < 0.0) c.budget_floor = 0.0;
+
+        if (c.cost_bootstrap_samples < 2) c.cost_bootstrap_samples = 2;
+        if (c.cost_bootstrap_samples > 32) c.cost_bootstrap_samples = 32;
+        if (c.cost_resample_period < 0) c.cost_resample_period = 0;
+        if (!(c.cost_ewma_beta > 0.0 && c.cost_ewma_beta <= 1.0)) {
+            c.cost_ewma_beta = 0.05;
+        }
+        if (c.cost_predict_margin <= 0.0) c.cost_predict_margin = 1.0;
+
         if (c.max_lead != 2) {
             std::cerr << "Aviso: HEAT2D_MAX_LEAD=" << c.max_lead
                       << " nao e suportado nesta versao; usando 2.\n";
@@ -266,6 +327,111 @@ struct alignas(heat2d::CACHELINE_BYTES) ThreadStats {
     }
 };
 
+
+constexpr int COST_BOOTSTRAP_MAX_SAMPLES = 32;
+
+struct alignas(heat2d::CACHELINE_BYTES) CostModel {
+    std::array<std::uint64_t, COST_BOOTSTRAP_MAX_SAMPLES> try_predict_samples{};
+    std::array<std::uint64_t, COST_BOOTSTRAP_MAX_SAMPLES> recompute_samples{};
+
+    int n_try_predict = 0;
+    int n_recompute = 0;
+    int n_accept = 0;
+    int n_evaluated = 0;
+
+    bool ready = false;
+    double try_predict_ticks = 0.0;
+    double recompute_ticks = 0.0;
+    double accept_probability = 0.0;
+
+    std::uint64_t opportunities_since_resample = 0;
+    std::uint64_t periodic_samples = 0;
+
+    static double median_prefix(
+            const std::array<std::uint64_t, COST_BOOTSTRAP_MAX_SAMPLES>& src,
+            int n) noexcept {
+        std::array<std::uint64_t, COST_BOOTSTRAP_MAX_SAMPLES> tmp = src;
+        std::sort(tmp.begin(), tmp.begin() + n);
+        if (n & 1) return static_cast<double>(tmp[static_cast<std::size_t>(n / 2)]);
+        return 0.5 * (
+            static_cast<double>(tmp[static_cast<std::size_t>(n / 2 - 1)]) +
+            static_cast<double>(tmp[static_cast<std::size_t>(n / 2)]));
+    }
+
+    void observe_bootstrap(std::uint64_t try_ticks,
+                           std::uint64_t rec_ticks,
+                           bool accepted,
+                           const Config& cfg) noexcept {
+        if (n_try_predict < cfg.cost_bootstrap_samples) {
+            try_predict_samples[static_cast<std::size_t>(n_try_predict++)] = try_ticks;
+        }
+        if (n_recompute < cfg.cost_bootstrap_samples) {
+            recompute_samples[static_cast<std::size_t>(n_recompute++)] = rec_ticks;
+        }
+
+        ++n_evaluated;
+        if (accepted) ++n_accept;
+
+        if (!ready &&
+            n_try_predict >= cfg.cost_bootstrap_samples &&
+            n_recompute >= cfg.cost_bootstrap_samples) {
+            try_predict_ticks =
+                median_prefix(try_predict_samples, cfg.cost_bootstrap_samples);
+            recompute_ticks =
+                median_prefix(recompute_samples, cfg.cost_bootstrap_samples);
+            accept_probability =
+                (n_evaluated > 0)
+                    ? static_cast<double>(n_accept) /
+                      static_cast<double>(n_evaluated)
+                    : 0.0;
+            ready = true;
+            opportunities_since_resample = 0;
+        }
+    }
+
+    void observe_periodic(std::uint64_t try_ticks,
+                          std::uint64_t rec_ticks,
+                          bool accepted,
+                          const Config& cfg) noexcept {
+        const double beta = cfg.cost_ewma_beta;
+        try_predict_ticks =
+            (1.0 - beta) * try_predict_ticks +
+            beta * static_cast<double>(try_ticks);
+        recompute_ticks =
+            (1.0 - beta) * recompute_ticks +
+            beta * static_cast<double>(rec_ticks);
+        accept_probability =
+            (1.0 - beta) * accept_probability +
+            beta * (accepted ? 1.0 : 0.0);
+        ++periodic_samples;
+    }
+
+    bool periodic_sample_due(const Config& cfg) noexcept {
+        if (!ready || cfg.cost_resample_period <= 0) return false;
+        ++opportunities_since_resample;
+        if (opportunities_since_resample <
+            static_cast<std::uint64_t>(cfg.cost_resample_period)) {
+            return false;
+        }
+        opportunities_since_resample = 0;
+        return true;
+    }
+
+    bool prefers_try_predict(const Config& cfg) const noexcept {
+        if (!cfg.enable_cost_model || !ready) {
+            return cfg.cost_predict < cfg.cost_recompute;
+        }
+
+        // Custo esperado de tentar PREDICT:
+        //   C_tryP + (1-a) C_R
+        // versus RECOMPUTE direto:
+        //   C_R
+        // Logo, vale tentar se C_tryP < a C_R.
+        const double rhs = accept_probability * recompute_ticks;
+        return cfg.cost_predict_margin * try_predict_ticks < rhs;
+    }
+};
+
 struct ThreadWorkspace {
     // Pnorth/Psouth armazenam o bound de perturbacao da dependencia. Depois da
     // verificacao de admissibilidade, em uma prediction aceita, seus elementos
@@ -273,11 +439,14 @@ struct ThreadWorkspace {
     std::vector<double> Pnorth;
     std::vector<double> Psouth;
     std::vector<double> Dcombined;
+    std::vector<double> calibration_scratch;
+    CostModel cost_model;
 
     void allocate(int N) {
         Pnorth.assign(static_cast<std::size_t>(N), 0.0);
         Psouth.assign(static_cast<std::size_t>(N), 0.0);
         Dcombined.assign(static_cast<std::size_t>(N), 0.0);
+        calibration_scratch.assign(static_cast<std::size_t>(N), 0.0);
     }
 };
 
@@ -384,45 +553,53 @@ static inline double q_value(const SideHistory& h,
          + a2[static_cast<std::size_t>(j)];
 }
 
-static inline bool can_recompute(const std::unique_ptr<ThreadHistory[]>& history,
-                                 const std::vector<LocalBlock>& blocks,
-                                 int tid,
-                                 int nb,
-                                 Side local_side,
-                                 int level) noexcept {
-    if (level < 1) return false;
-    if (blocks[static_cast<std::size_t>(nb)].ni < 2) return false;
+struct RecomputeView {
+    const InterfaceSlot* remote_prev = nullptr;
+    const InterfaceSlot* local_prev = nullptr;
+
+    bool valid() const noexcept {
+        return remote_prev != nullptr && local_prev != nullptr;
+    }
+};
+
+static inline RecomputeView prepare_recompute_view(
+        const std::unique_ptr<ThreadHistory[]>& history,
+        const std::vector<LocalBlock>& blocks,
+        int tid,
+        int nb,
+        Side local_side,
+        int level) noexcept {
+    RecomputeView v;
+    if (level < 1) return v;
+    if (blocks[static_cast<std::size_t>(nb)].ni < 2) return v;
+
     const Side remote_side = opposite(local_side);
-    const InterfaceSlot* rprev = history[static_cast<std::size_t>(nb)].side(remote_side).get(level - 1);
-    const InterfaceSlot* lprev = history[static_cast<std::size_t>(tid)].side(local_side).get(level - 1);
-    return rprev && lprev;
+    v.remote_prev =
+        history[static_cast<std::size_t>(nb)].side(remote_side).get(level - 1);
+    v.local_prev =
+        history[static_cast<std::size_t>(tid)].side(local_side).get(level - 1);
+    return v;
 }
 
-static inline bool recompute_remote_boundary(const std::unique_ptr<ThreadHistory[]>& history,
-                                             const std::vector<LocalBlock>& blocks,
-                                             int tid,
-                                             int nb,
-                                             Side local_side,
-                                             int level,
+static inline bool recompute_remote_boundary(const RecomputeView& v,
                                              int N,
                                              double mu,
-                                             double* halo) {
-    if (!can_recompute(history, blocks, tid, nb, local_side, level)) return false;
+                                             double* halo) noexcept {
+    if (!v.valid()) return false;
 
-    const Side remote_side = opposite(local_side);
-    const InterfaceSlot* rprev = history[static_cast<std::size_t>(nb)].side(remote_side).get(level - 1);
-    const InterfaceSlot* lprev = history[static_cast<std::size_t>(tid)].side(local_side).get(level - 1);
-    if (!rprev || !lprev) return false;
+    const InterfaceSlot& rprev = *v.remote_prev;
+    const InterfaceSlot& lprev = *v.local_prev;
 
     halo[0] = 0.0;
     halo[N - 1] = 0.0;
     for (int j = 1; j <= N - 2; ++j) {
-        const double b = rprev->boundary[static_cast<std::size_t>(j)];
+        const std::size_t k = static_cast<std::size_t>(j);
+        const double b = rprev.boundary[k];
         halo[j] = b + mu * (
-            rprev->inner1[static_cast<std::size_t>(j)] +
-            lprev->boundary[static_cast<std::size_t>(j)] +
-            rprev->boundary[static_cast<std::size_t>(j - 1)] +
-            rprev->boundary[static_cast<std::size_t>(j + 1)] -
+            rprev.inner1[k] +
+            lprev.boundary[k] +
+            rprev.boundary[static_cast<std::size_t>(j - 1)] +
+            rprev.boundary[static_cast<std::size_t>(j + 1)] -
             4.0 * b);
     }
     return true;
@@ -612,14 +789,17 @@ static inline bool prediction_is_admissible(const std::unique_ptr<ThreadHistory[
                                             double* predicted_halo,
                                             double& max_ratio_out,
                                             double& sum_ratio_out,
-                                            std::uint64_t& samples_out) {
+                                            std::uint64_t& samples_out,
+                                            bool& evaluated_out) {
     max_ratio_out = 0.0;
     sum_ratio_out = 0.0;
     samples_out = 0;
+    evaluated_out = false;
 
     if (!cfg.enable_predict) return false;
     if (!compute_predict_bound_line(history, blocks, tid, nb, local_side, level,
                                     N, mu, Pbound, predicted_halo)) return false;
+    evaluated_out = true;
 
     // Para predizer U^level, o orcamento e avaliado no nivel anterior level-1.
     const int budget_level = level - 1;
@@ -680,7 +860,9 @@ static inline ResolveResult resolve_halo(std::unique_ptr<ThreadHistory[]>& histo
                                         double mu,
                                         const Config& cfg,
                                         double* halo,
-                                        std::vector<double>& Pbound) {
+                                        std::vector<double>& Pbound,
+                                        CostModel& cost_model,
+                                        double* calibration_scratch) {
     ResolveResult result;
 
     const int nb = (local_side == Side::North) ? tid - 1 : tid + 1;
@@ -692,62 +874,179 @@ static inline ResolveResult resolve_halo(std::unique_ptr<ThreadHistory[]>& histo
 
     const Side remote_side = opposite(local_side);
 
-    // READ: snapshot desejado ja foi publicado.
-    if (const InterfaceSlot* exact = history[static_cast<std::size_t>(nb)].side(remote_side).get(level)) {
+    if (const InterfaceSlot* exact =
+            history[static_cast<std::size_t>(nb)].side(remote_side).get(level)) {
         copy_boundary(*exact, halo, N);
         result.action = Action::Read;
         return result;
     }
 
-    // Avalia PREDICT somente quando READ nao estava disponivel. A linha
-    // predita e escrita diretamente no halo; se houver rejeicao, RECOMPUTE/WAIT
-    // a sobrescrevem antes do stencil.
-    bool pred_ok = false;
-    if (cfg.enable_predict) {
-        pred_ok = prediction_is_admissible(history, blocks, tid, nb, local_side, level,
-                                            N, mu, cfg, Pbound, halo,
-                                            result.max_ratio, result.sum_ratio,
-                                            result.ratio_samples);
+    const RecomputeView rec_view =
+        cfg.enable_recompute
+            ? prepare_recompute_view(history, blocks, tid, nb, local_side, level)
+            : RecomputeView{};
+    const bool rec_ok = cfg.enable_recompute && rec_view.valid();
+
+    if (!rec_ok) {
+        bool pred_ok = false;
+        bool pred_evaluated = false;
+
+        if (cfg.enable_predict) {
+            pred_ok = prediction_is_admissible(
+                history, blocks, tid, nb, local_side, level,
+                N, mu, cfg, Pbound, halo,
+                result.max_ratio, result.sum_ratio, result.ratio_samples,
+                pred_evaluated);
+
+            if constexpr (PROFILE_STATS_ENABLED) {
+                if (pred_evaluated && !pred_ok) result.predict_rejected = true;
+            }
+        }
+
+        if (pred_ok && cfg.cost_predict < cfg.cost_wait) {
+            result.action = Action::Predict;
+            return result;
+        }
+
+        wait_until_at_least(progress[static_cast<std::size_t>(nb)], level);
+        const InterfaceSlot* exact =
+            history[static_cast<std::size_t>(nb)].side(remote_side).get(level);
+        if (!exact) {
+            std::cerr << "Erro interno: snapshot nivel " << level
+                      << " do vizinho " << nb
+                      << " indisponivel apos WAIT.\n";
+            std::abort();
+        }
+        copy_boundary(*exact, halo, N);
+        result.action = Action::Wait;
+        return result;
+    }
+
+    if (cfg.enable_predict && cfg.enable_cost_model) {
+        const bool model_ready_before = cost_model.ready;
+        const bool fallback_prefers_predict =
+            cfg.cost_predict < cfg.cost_recompute;
+        const bool model_prefers_predict =
+            cost_model.prefers_try_predict(cfg);
+
+        const bool request_pair_sample =
+            !cost_model.ready || cost_model.periodic_sample_due(cfg);
+
+        if (request_pair_sample) {
+            bool pred_evaluated = false;
+
+            const std::uint64_t tp0 = cost_ticks_begin();
+            const bool pred_ok = prediction_is_admissible(
+                history, blocks, tid, nb, local_side, level,
+                N, mu, cfg, Pbound, halo,
+                result.max_ratio, result.sum_ratio, result.ratio_samples,
+                pred_evaluated);
+            const std::uint64_t tp1 = cost_ticks_end();
+
+            if constexpr (PROFILE_STATS_ENABLED) {
+                if (pred_evaluated && !pred_ok) result.predict_rejected = true;
+            }
+
+            if (!pred_evaluated) {
+                recompute_remote_boundary(rec_view, N, mu, halo);
+                result.action = Action::Recompute;
+                return result;
+            }
+
+            const bool choose_predict =
+                model_ready_before ? model_prefers_predict
+                                   : fallback_prefers_predict;
+
+            std::uint64_t tr0 = 0;
+            std::uint64_t tr1 = 0;
+
+            if (pred_ok && choose_predict) {
+                tr0 = cost_ticks_begin();
+                recompute_remote_boundary(rec_view, N, mu, calibration_scratch);
+                tr1 = cost_ticks_end();
+            } else {
+                tr0 = cost_ticks_begin();
+                recompute_remote_boundary(rec_view, N, mu, halo);
+                tr1 = cost_ticks_end();
+            }
+
+            const std::uint64_t try_ticks = tp1 - tp0;
+            const std::uint64_t rec_ticks = tr1 - tr0;
+
+            if (!model_ready_before) {
+                cost_model.observe_bootstrap(try_ticks, rec_ticks, pred_ok, cfg);
+            } else {
+                cost_model.observe_periodic(try_ticks, rec_ticks, pred_ok, cfg);
+            }
+
+            if (pred_ok && choose_predict) {
+                result.action = Action::Predict;
+                return result;
+            }
+
+            result.action = Action::Recompute;
+            return result;
+        }
+
+        if (!cost_model.prefers_try_predict(cfg)) {
+            recompute_remote_boundary(rec_view, N, mu, halo);
+            result.action = Action::Recompute;
+            return result;
+        }
+
+        bool pred_evaluated = false;
+        const bool pred_ok = prediction_is_admissible(
+            history, blocks, tid, nb, local_side, level,
+            N, mu, cfg, Pbound, halo,
+            result.max_ratio, result.sum_ratio, result.ratio_samples,
+            pred_evaluated);
+
         if constexpr (PROFILE_STATS_ENABLED) {
-            if (!pred_ok && level >= 3) result.predict_rejected = true;
+            if (pred_evaluated && !pred_ok) result.predict_rejected = true;
+        }
+
+        if (pred_ok) {
+            result.action = Action::Predict;
+            return result;
+        }
+
+        recompute_remote_boundary(rec_view, N, mu, halo);
+        result.action = Action::Recompute;
+        return result;
+    }
+
+    bool pred_ok = false;
+    bool pred_evaluated = false;
+    if (cfg.enable_predict) {
+        pred_ok = prediction_is_admissible(
+            history, blocks, tid, nb, local_side, level,
+            N, mu, cfg, Pbound, halo,
+            result.max_ratio, result.sum_ratio, result.ratio_samples,
+            pred_evaluated);
+        if constexpr (PROFILE_STATS_ENABLED) {
+            if (pred_evaluated && !pred_ok) result.predict_rejected = true;
         }
     }
 
-    const bool rec_ok = cfg.enable_recompute &&
-                        can_recompute(history, blocks, tid, nb, local_side, level);
-
-    double best_cost = cfg.cost_wait;
-    Action best = Action::Wait;
-
-    if (rec_ok && cfg.cost_recompute < best_cost) {
-        best_cost = cfg.cost_recompute;
-        best = Action::Recompute;
-    }
-    if (pred_ok && cfg.cost_predict < best_cost) {
-        best_cost = cfg.cost_predict;
-        best = Action::Predict;
-    }
-
-    if (best == Action::Predict) {
+    if (pred_ok && cfg.cost_predict < cfg.cost_recompute &&
+        cfg.cost_predict < cfg.cost_wait) {
         result.action = Action::Predict;
         return result;
     }
 
-    if (best == Action::Recompute) {
-        if (recompute_remote_boundary(history, blocks, tid, nb, local_side,
-                                      level, N, mu, halo)) {
-            result.action = Action::Recompute;
-            return result;
-        }
+    if (cfg.cost_recompute < cfg.cost_wait) {
+        recompute_remote_boundary(rec_view, N, mu, halo);
+        result.action = Action::Recompute;
+        return result;
     }
 
-    // WAIT: espera a publicacao do nivel desejado e entao copia o snapshot.
     wait_until_at_least(progress[static_cast<std::size_t>(nb)], level);
-    const InterfaceSlot* exact = history[static_cast<std::size_t>(nb)].side(remote_side).get(level);
+    const InterfaceSlot* exact =
+        history[static_cast<std::size_t>(nb)].side(remote_side).get(level);
     if (!exact) {
-        // Com max_lead=2 e HISTORY_SLOTS=6 isto nao deve ocorrer.
         std::cerr << "Erro interno: snapshot nivel " << level
-                  << " do vizinho " << nb << " indisponivel apos WAIT.\n";
+                  << " do vizinho " << nb
+                  << " indisponivel apos WAIT.\n";
         std::abort();
     }
     copy_boundary(*exact, halo, N);
@@ -793,8 +1092,13 @@ static inline void print_config(const Config& c, double mu) {
               << "Adaptive kappa: " << c.kappa << '\n'
               << "Adaptive predict: " << (c.enable_predict ? "on" : "off") << '\n'
               << "Adaptive recompute: " << (c.enable_recompute ? "on" : "off") << '\n'
-              << "Adaptive costs (P/R/W): " << c.cost_predict << " / "
+              << "Adaptive fallback costs (P/R/W): " << c.cost_predict << " / "
               << c.cost_recompute << " / " << c.cost_wait << '\n'
+              << "Adaptive online cost model: " << (c.enable_cost_model ? "on" : "off") << '\n'
+              << "Adaptive cost bootstrap samples/thread: " << c.cost_bootstrap_samples << '\n'
+              << "Adaptive cost resample period: " << c.cost_resample_period << '\n'
+              << "Adaptive cost EWMA beta: " << c.cost_ewma_beta << '\n'
+              << "Adaptive cost P margin: " << c.cost_predict_margin << '\n'
               << "Adaptive max lead: " << c.max_lead << '\n'
               << "Adaptive profile stats: " << (PROFILE_STATS_ENABLED ? "on" : "off") << '\n'
               << "mu: " << mu << '\n'
@@ -902,6 +1206,8 @@ int main() {
         std::vector<double>& Pnorth = ws.Pnorth;
         std::vector<double>& Psouth = ws.Psouth;
         std::vector<double>& Dcombined = ws.Dcombined;
+        double* calibration_scratch = ws.calibration_scratch.data();
+        CostModel& cost_model = ws.cost_model;
 
         for (int step = 0; step < T; ++step) {
             // Guarda de historico: permite que uma thread termine no maximo dois
@@ -930,12 +1236,17 @@ int main() {
             double* src = (step & 1) ? b.U1.data() : b.U0.data();
             double* dst = (step & 1) ? b.U0.data() : b.U1.data();
 
-            ResolveResult rn = resolve_halo(history, blocks, progress, tid, nt,
-                                            Side::North, step, N, mu, cfg,
-                                            src + heat2d::idx2(0, 0, b.ld), Pnorth);
-            ResolveResult rs = resolve_halo(history, blocks, progress, tid, nt,
-                                            Side::South, step, N, mu, cfg,
-                                            src + heat2d::idx2(b.ni + 1, 0, b.ld), Psouth);
+            ResolveResult rn = resolve_halo(
+                history, blocks, progress, tid, nt,
+                Side::North, step, N, mu, cfg,
+                src + heat2d::idx2(0, 0, b.ld), Pnorth,
+                cost_model, calibration_scratch);
+
+            ResolveResult rs = resolve_halo(
+                history, blocks, progress, tid, nt,
+                Side::South, step, N, mu, cfg,
+                src + heat2d::idx2(b.ni + 1, 0, b.ld), Psouth,
+                cost_model, calibration_scratch);
 
             if constexpr (PROFILE_STATS_ENABLED) {
                 st.count(rn.action);
@@ -998,6 +1309,57 @@ int main() {
 
     const auto t1 = std::chrono::high_resolution_clock::now();
     const double secs = std::chrono::duration<double>(t1 - t0).count();
+
+    if (cfg.enable_cost_model) {
+        int ready_models = 0;
+        std::vector<double> try_costs;
+        std::vector<double> rec_costs;
+        std::vector<double> accept_probs;
+        try_costs.reserve(static_cast<std::size_t>(max_threads));
+        rec_costs.reserve(static_cast<std::size_t>(max_threads));
+        accept_probs.reserve(static_cast<std::size_t>(max_threads));
+
+        std::uint64_t periodic_samples = 0;
+
+        for (int t = 0; t < max_threads; ++t) {
+            const CostModel& cm = workspace[static_cast<std::size_t>(t)].cost_model;
+            periodic_samples += cm.periodic_samples;
+            if (!cm.ready) continue;
+            ++ready_models;
+            try_costs.push_back(cm.try_predict_ticks);
+            rec_costs.push_back(cm.recompute_ticks);
+            accept_probs.push_back(cm.accept_probability);
+        }
+
+        auto median_double = [](std::vector<double>& x) -> double {
+            if (x.empty()) return 0.0;
+            std::sort(x.begin(), x.end());
+            const std::size_t n = x.size();
+            if (n & 1u) return x[n / 2];
+            return 0.5 * (x[n / 2 - 1] + x[n / 2]);
+        };
+
+        const double med_try = median_double(try_costs);
+        const double med_rec = median_double(rec_costs);
+        const double med_acc = median_double(accept_probs);
+
+        std::cout << std::setprecision(16)
+                  << "Adaptive cost models ready: "
+                  << ready_models << " / " << max_threads << '\n'
+                  << "Adaptive learned try-PREDICT median: "
+                  << med_try << ' ' << COST_TICK_UNIT << '\n'
+                  << "Adaptive learned RECOMPUTE median: "
+                  << med_rec << ' ' << COST_TICK_UNIT << '\n'
+                  << "Adaptive learned PREDICT acceptance median: "
+                  << med_acc << '\n'
+                  << "Adaptive periodic cost samples: "
+                  << periodic_samples << '\n';
+
+        if (med_rec > 0.0) {
+            std::cout << "Adaptive learned tryP/R ratio: "
+                      << (med_try / med_rec) << '\n';
+        }
+    }
 
     const std::size_t global_ld =
         heat2d::round_up(static_cast<std::size_t>(N), doubles_per_cacheline);
