@@ -15,3 +15,5 @@ validate-*.out
 validate-*.err
 
 *.o
+heat2d_adaptive
+convergence_results/
