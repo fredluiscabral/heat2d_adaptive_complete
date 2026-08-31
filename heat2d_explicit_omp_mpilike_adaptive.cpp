@@ -1468,7 +1468,7 @@ int main() {
     const double final_time = static_cast<double>(T) * dt;
     const heat2d::ErrorStats err = heat2d::compute_errors(G.data(), N, global_ld, p, final_time);
     heat2d::print_summary("omp_mpilike_adaptive", p, dt, mu, secs, err);
-    heat2d::write_output("output.txt", G.data(), N, global_ld, h);
+    //heat2d::write_output("output.txt", G.data(), N, global_ld, h);
 
     return 0;
 }
