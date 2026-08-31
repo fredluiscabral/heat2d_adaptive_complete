@@ -1,0 +1,13 @@
+# Parametros do FTCS 2D adaptativo
+# Dominio: [0,1] x [0,1]
+# Solucao exata usada na verificacao:
+#   u(x,y,t) = sin(pi*x) sin(pi*y) exp(-2*pi^2*alpha*t)
+#
+# theta e a fracao do limite CFL: mu = theta/4.
+# Para o FTCS 2D: 0 < theta <= 1.
+
+N = 512
+T = 100
+TILE = 32
+alpha = 0.1
+theta = 0.9

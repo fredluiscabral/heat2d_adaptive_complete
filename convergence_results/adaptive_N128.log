@@ -1,0 +1,33 @@
+Threads: 4
+Adaptive eta: 0.5
+Adaptive kappa: 1
+Adaptive predict: on
+Adaptive recompute: on
+Adaptive costs (P/R/W): 2 / 6 / 1000
+Adaptive max lead: 2
+mu: 0.225
+theta=4*mu: 0.9
+Adaptive actions READ: 23
+Adaptive actions RECOMPUTE: 8
+Adaptive actions PREDICT: 5
+Adaptive actions WAIT: 0
+Adaptive lead-guard waits: 2
+Adaptive predict rejected: 2
+Accepted PREDICT max Esync/(eta*B): 0.9225732603669321
+Accepted PREDICT avg Esync/(eta*B): 0.6610307776754633
+Rejected PREDICT max Esync/(eta*B): 1.13680828487417
+Rejected PREDICT avg Esync/(eta*B): 0.6990824088038566
+Variant: omp_mpilike_adaptive
+N: 128
+T: 6
+TILE: 32
+alpha: 0.10000000000000001
+theta: 0.90000000000000002
+h: 0.007874015748031496
+dt: 0.00013950027900055798
+mu: 0.22500000000000001
+final_time: 0.0008370016740033479
+Tempo : 6.9258999999999995e-05 s
+L1_mean: 5.7336874047417671e-08
+L2_rms: 7.1314740938644719e-08
+Linf: 1.4978046488244615e-07

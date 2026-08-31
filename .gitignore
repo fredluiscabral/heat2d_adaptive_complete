@@ -1,0 +1,17 @@
+heat2d_explicit_omp_mpilike
+heat2d_adaptive_validate
+heat2d_adaptive_perf
+
+output.txt
+adaptive_stats.txt
+
+sanity_results/
+sweep_N_T_results/
+sd_results_*/
+
+slurm-*.out
+slurm-*.err
+validate-*.out
+validate-*.err
+
+*.o
