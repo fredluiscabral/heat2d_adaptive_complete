@@ -1,0 +1,8 @@
+# Exemplo do caso atualmente usado no SDumont.
+# O script NAO copia nem altera este arquivo; ele usa o param.txt que ja existe no repositorio.
+N = 8192
+T = 1000
+TILE = 32
+alpha = 0.1
+theta = 0.9
+WRITE_OUTPUT = 0
