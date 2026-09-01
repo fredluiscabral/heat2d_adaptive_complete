@@ -27,7 +27,7 @@ set -euo pipefail
 # ============================================================
 
 REPS="${REPS:-10}"
-OUTDIR="${OUTDIR:-benchmark_models_results_sd_compact}"
+OUTDIR="${OUTDIR:-benchmark_models_results_sd}"
 COST_MODEL="heat2d_cost_model.dat"
 
 BASELINE="./heat2d_explicit_omp_mpilike"
