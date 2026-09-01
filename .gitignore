@@ -17,3 +17,18 @@ validate-*.err
 *.o
 heat2d_adaptive
 convergence_results/
+
+# Binarios gerados
+/heat2d_adaptive_busywait
+/heat2d_adaptive_busywait_profile
+/heat2d_adaptive_calibrated
+/heat2d_adaptive_compact
+/heat2d_adaptive_online
+/heat2d_adaptive_sem
+/heat2d_adaptive_sem_profile
+/heat2d_dependency_calibrate
+/heat2d_dependency_oracle
+/heat2d_explicit_omp_busywait_nobarrier_nofs
+/heat2d_explicit_omp_sem_nobarrier_nofs
+/heat2d_wait_calibrate_busywait
+/heat2d_wait_calibrate_sem
