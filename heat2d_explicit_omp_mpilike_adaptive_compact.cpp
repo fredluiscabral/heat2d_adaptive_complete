@@ -64,6 +64,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -83,6 +84,48 @@
 
 static_assert(HEAT2D_PROFILE_STATS == 0 || HEAT2D_PROFILE_STATS == 1,
               "HEAT2D_PROFILE_STATS deve ser 0 ou 1");
+
+static bool param_requests_output(const char* path) {
+    std::ifstream in(path);
+    if (!in) return true; // load_params_strict() ja reporta o erro de arquivo.
+
+    std::string line;
+    while (std::getline(in, line)) {
+        const std::size_t comment = line.find('#');
+        if (comment != std::string::npos) line.resize(comment);
+
+        const std::size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        auto trim = [](std::string x) {
+            const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+            x.erase(x.begin(), std::find_if(x.begin(), x.end(), not_space));
+            x.erase(std::find_if(x.rbegin(), x.rend(), not_space).base(), x.end());
+            return x;
+        };
+
+        std::string key = trim(line.substr(0, eq));
+        if (key != "WRITE_OUTPUT") continue;
+
+        std::string value = trim(line.substr(eq + 1));
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        if (value == "0" || value == "off" || value == "false" || value == "no") {
+            return false;
+        }
+        if (value == "1" || value == "on" || value == "true" || value == "yes") {
+            return true;
+        }
+
+        // Valor invalido: preserva comportamento conservador. A validacao
+        // principal continua sendo responsabilidade de load_params_strict().
+        return true;
+    }
+
+    // Compatibilidade com param.txt antigos sem WRITE_OUTPUT.
+    return true;
+}
 
 #if defined(__x86_64__) || defined(__i386__)
   #include <immintrin.h>
@@ -1362,6 +1405,7 @@ int main() {
 
     heat2d::Params p;
     if (!heat2d::load_params_strict("param.txt", p)) return 1;
+    const bool write_output_enabled = param_requests_output("param.txt");
 
     const int N = p.N;
     const int T = p.T;
@@ -1633,8 +1677,10 @@ int main() {
         heat2d::print_summary(
             "omp_mpilike_adaptive_compact",
             p, dt, mu, secs, err);
-        heat2d::write_output(
-            "output.txt", G.data(), N, global_ld, h);
+        if (write_output_enabled) {
+            heat2d::write_output(
+                "output.txt", G.data(), N, global_ld, h);
+        }
         return 0;
     }
 
@@ -1882,7 +1928,9 @@ int main() {
     const double final_time = static_cast<double>(T) * dt;
     const heat2d::ErrorStats err = heat2d::compute_errors(G.data(), N, global_ld, p, final_time);
     heat2d::print_summary("omp_mpilike_adaptive_compact_fullpredict", p, dt, mu, secs, err);
-    heat2d::write_output("output.txt", G.data(), N, global_ld, h);
+    if (write_output_enabled) {
+        heat2d::write_output("output.txt", G.data(), N, global_ld, h);
+    }
 
     return 0;
 }
