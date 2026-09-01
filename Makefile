@@ -3,6 +3,7 @@ CXXFLAGS := -O3 -std=c++17 -fopenmp -Wall -Wextra -Wpedantic
 LDFLAGS  := -fopenmp -pthread
 
 COMMON := heat2d_explicit_common.hpp
+PROFILE_COMMON := heat2d_residual_wait_profile.hpp
 
 # -----------------------------------------------------------------------------
 # Current MPI-like study
@@ -48,6 +49,11 @@ SM_ADP_BIN := heat2d_adaptive_sem
 BW_PROF_BIN := heat2d_adaptive_busywait_profile
 SM_PROF_BIN := heat2d_adaptive_sem_profile
 
+BW_RES_SRC := heat2d_explicit_omp_busywait_nobarrier_nofs_residual_profile.cpp
+SM_RES_SRC := heat2d_explicit_omp_sem_nobarrier_nofs_residual_profile.cpp
+BW_RES_BIN := heat2d_residual_profile_busywait
+SM_RES_BIN := heat2d_residual_profile_sem
+
 .PHONY: all current baselines calibrators adaptive diagnostics clean
 
 all: current baselines calibrators adaptive diagnostics
@@ -56,7 +62,7 @@ current: $(MPI_BASE_BIN) $(MPI_ORCL_BIN) $(MPI_CAL_BIN) $(MPI_OFF_BIN) $(MPI_ONL
 baselines: $(BW_BASE_BIN) $(SM_BASE_BIN)
 calibrators: $(BW_WCAL_BIN) $(SM_WCAL_BIN)
 adaptive: $(BW_ADP_BIN) $(SM_ADP_BIN)
-diagnostics: $(BW_PROF_BIN) $(SM_PROF_BIN)
+diagnostics: $(BW_PROF_BIN) $(SM_PROF_BIN) $(BW_RES_BIN) $(SM_RES_BIN)
 
 $(MPI_BASE_BIN): $(MPI_BASE_SRC) $(COMMON)
 	$(CXX) $(CXXFLAGS) $(MPI_BASE_SRC) -o $@ $(LDFLAGS)
@@ -100,9 +106,15 @@ $(BW_PROF_BIN): $(BW_ADP_SRC) $(COMMON)
 $(SM_PROF_BIN): $(SM_ADP_SRC) $(COMMON)
 	$(CXX) $(CXXFLAGS) -DHEAT2D_PROFILE_STATS=1 $(SM_ADP_SRC) -o $@ $(LDFLAGS)
 
+$(BW_RES_BIN): $(BW_RES_SRC) $(COMMON) $(PROFILE_COMMON)
+	$(CXX) $(CXXFLAGS) $(BW_RES_SRC) -o $@ $(LDFLAGS)
+
+$(SM_RES_BIN): $(SM_RES_SRC) $(COMMON) $(PROFILE_COMMON)
+	$(CXX) $(CXXFLAGS) $(SM_RES_SRC) -o $@ $(LDFLAGS)
+
 clean:
 	rm -f $(MPI_BASE_BIN) $(MPI_ORCL_BIN) $(MPI_CAL_BIN) $(MPI_OFF_BIN) $(MPI_ONL_BIN) $(MPI_CMP_BIN)
 	rm -f $(BW_BASE_BIN) $(SM_BASE_BIN) $(BW_WCAL_BIN) $(SM_WCAL_BIN)
-	rm -f $(BW_ADP_BIN) $(SM_ADP_BIN) $(BW_PROF_BIN) $(SM_PROF_BIN)
+	rm -f $(BW_ADP_BIN) $(SM_ADP_BIN) $(BW_PROF_BIN) $(SM_PROF_BIN) $(BW_RES_BIN) $(SM_RES_BIN)
 	rm -f heat2d_cost_model.dat heat2d_wait_cost_busywait.dat heat2d_wait_cost_semaphore.dat
-	rm -f output.txt adaptive_stats.txt
+	rm -f output.txt adaptive_stats.txt heat2d_residual_*.csv

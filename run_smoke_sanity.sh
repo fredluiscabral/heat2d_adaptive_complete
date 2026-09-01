@@ -24,9 +24,11 @@ set -euo pipefail
 #   diagnostic/profile builds:
 #     ./heat2d_adaptive_busywait_profile
 #     ./heat2d_adaptive_sem_profile
+#     ./heat2d_residual_profile_busywait
+#     ./heat2d_residual_profile_sem
 #
 # Smoke stage:
-#   - builds and runs all 14 executables;
+#   - builds and runs all 16 executables;
 #   - checks WRITE_OUTPUT=0 for every execution;
 #   - checks generation of all three cost-model files;
 #   - checks that profile binaries report READ/RECOMPUTE/PREDICT/WAIT actions.
@@ -74,6 +76,8 @@ BW_ADP="${BW_ADP:-./heat2d_adaptive_busywait}"
 SM_ADP="${SM_ADP:-./heat2d_adaptive_sem}"
 BW_PROF="${BW_PROF:-./heat2d_adaptive_busywait_profile}"
 SM_PROF="${SM_PROF:-./heat2d_adaptive_sem_profile}"
+BW_RES="${BW_RES:-./heat2d_residual_profile_busywait}"
+SM_RES="${SM_RES:-./heat2d_residual_profile_sem}"
 
 COST_MODEL="${COST_MODEL:-heat2d_cost_model.dat}"
 BW_WAIT_MODEL="${BW_WAIT_MODEL:-heat2d_wait_cost_busywait.dat}"
@@ -188,6 +192,7 @@ ALL_EXES=(
     "${MPI_BASE}" "${MPI_ORACLE}" "${MPI_CAL}" "${MPI_OFF}" "${MPI_ONL}" "${MPI_CMP}"
     "${BW_BASE}" "${SM_BASE}" "${BW_WCAL}" "${SM_WCAL}"
     "${BW_ADP}" "${SM_ADP}" "${BW_PROF}" "${SM_PROF}"
+    "${BW_RES}" "${SM_RES}"
 )
 for exe in "${ALL_EXES[@]}"; do
     if [[ ! -x "${exe}" ]]; then
@@ -212,7 +217,7 @@ echo "OMP_PROC_BIND  : ${OMP_PROC_BIND}"
 # =============================================================================
 echo
 echo "============================================================"
-echo "COMPLETE SMOKE TEST - 14 EXECUTABLES"
+echo "COMPLETE SMOKE TEST - 16 EXECUTABLES"
 echo "============================================================"
 
 set_param N "${SMOKE_N}"
@@ -225,7 +230,7 @@ rm -f "${COST_MODEL}" "${BW_WAIT_MODEL}" "${SM_WAIT_MODEL}" output.txt adaptive_
 echo "N=${SMOKE_N} T=${SMOKE_T} TILE=${SMOKE_TILE} WRITE_OUTPUT=0"
 
 step=0
-TOTAL=14
+TOTAL=16
 announce() { step=$((step+1)); printf '[%02d/%02d] %s\n' "${step}" "${TOTAL}" "$1"; }
 
 announce "MPI-like baseline"
@@ -242,6 +247,28 @@ run_logged "${MPI_CAL}" "${OUTDIR}/smoke_calibration_pr.log" \
     HEAT2D_COST_FILE="${COST_MODEL}"
 [[ -s "${COST_MODEL}" ]] || { echo "ERRO: ${MPI_CAL} nao gerou ${COST_MODEL}." >&2; exit 22; }
 require_solver_metrics "${OUTDIR}/smoke_calibration_pr.log"
+RECOMPUTE_CYCLES="$(awk '$1 == "recompute_ticks" {print $2; exit}' "${COST_MODEL}")"
+[[ -n "${RECOMPUTE_CYCLES}" ]] || { echo "ERRO: recompute_ticks ausente em ${COST_MODEL}." >&2; exit 25; }
+
+announce "busy-wait residual-WAIT profile"
+BW_RES_CSV="${OUTDIR}/smoke_residual_busywait.csv"
+rm -f "${BW_RES_CSV}"
+run_logged "${BW_RES}" "${OUTDIR}/smoke_residual_busywait.log" \
+    HEAT2D_RECOMPUTE_CYCLES="${RECOMPUTE_CYCLES}" \
+    HEAT2D_RESIDUAL_FILE="${BW_RES_CSV}"
+require_solver_metrics "${OUTDIR}/smoke_residual_busywait.log"
+require_scalar "Residual initial misses" "${OUTDIR}/smoke_residual_busywait.log" >/dev/null
+[[ -s "${BW_RES_CSV}" ]] || { echo "ERRO: perfil residual busy-wait nao gerou CSV." >&2; exit 26; }
+
+announce "semaphore residual-WAIT profile"
+SM_RES_CSV="${OUTDIR}/smoke_residual_semaphore.csv"
+rm -f "${SM_RES_CSV}"
+run_logged "${SM_RES}" "${OUTDIR}/smoke_residual_semaphore.log" \
+    HEAT2D_RECOMPUTE_CYCLES="${RECOMPUTE_CYCLES}" \
+    HEAT2D_RESIDUAL_FILE="${SM_RES_CSV}"
+require_solver_metrics "${OUTDIR}/smoke_residual_semaphore.log"
+require_scalar "Residual initial misses" "${OUTDIR}/smoke_residual_semaphore.log" >/dev/null
+[[ -s "${SM_RES_CSV}" ]] || { echo "ERRO: perfil residual semaforo nao gerou CSV." >&2; exit 27; }
 
 announce "MPI-like adaptive calibrated"
 run_logged "${MPI_OFF}" "${OUTDIR}/smoke_mpilike_calibrated.log" \

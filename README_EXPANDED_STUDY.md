@@ -64,3 +64,34 @@ Ao final:
 ```bash
 cat benchmark_models_results_sd/summary.csv
 ```
+
+## Residual WAIT diagnostic
+
+The study now includes diagnostic builds that measure the **residual wait** seen
+at the instant a dependency is first found unavailable:
+
+- `heat2d_residual_profile_busywait`
+- `heat2d_residual_profile_sem`
+
+These are diagnostic binaries, not performance baselines. They preserve the
+numerical FTCS update and the original synchronization family while adding an
+availability probe and TSC-based timing around only the residual wait after an
+initial miss. On x86, the reported unit is cycles.
+
+The key comparison is against the independently calibrated RECOMPUTE cost:
+
+`P(W_residual < C_RECOMPUTE)`.
+
+A high value means that many immediate RECOMPUTE decisions are more expensive
+than simply waiting for the dependency to become available. The profile also
+reports min/mean/p50/p75/p90/p95/p99/max and the initial-miss fraction.
+
+For a focused SDumont run use:
+
+```bash
+sbatch run_residual_wait_profile.slurm
+```
+
+Default thread counts are 64, 128, 160 and 192, with three profile repetitions.
+Set `SAVE_SAMPLES=1` at submission time to retain every individual residual-wait
+sample; otherwise only logs and consolidated CSV summaries are kept.

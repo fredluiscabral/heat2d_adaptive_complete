@@ -29,10 +29,11 @@ set -euo pipefail
 #   1) PREDICT/RECOMPUTE offline calibration (existing MPI-like calibrator);
 #   2) observed busy-wait WAIT calibration;
 #   3) observed semaphore WAIT calibration;
-#   4) one diagnostic profile run of each new adaptive backend;
-#   5) one warm-up per timed variant;
-#   6) REPS valid runs, with rotated variant order;
-#   7) per-thread and combined CSV summaries.
+#   4) one residual-WAIT profile of each original busy/semaphore baseline;
+#   5) one diagnostic profile run of each new adaptive backend;
+#   6) one warm-up per timed variant;
+#   7) REPS valid runs, with rotated variant order;
+#   8) per-thread and combined CSV summaries.
 #
 # Requires WRITE_OUTPUT = 0 in param.txt.
 # The result root remains benchmark_models_results_sd; no rm -rf is used.
@@ -59,6 +60,8 @@ BW_ADP="./heat2d_adaptive_busywait"
 SM_ADP="./heat2d_adaptive_sem"
 BW_PROF="./heat2d_adaptive_busywait_profile"
 SM_PROF="./heat2d_adaptive_sem_profile"
+BW_RES="./heat2d_residual_profile_busywait"
+SM_RES="./heat2d_residual_profile_sem"
 
 cd "${SLURM_SUBMIT_DIR}"
 
@@ -114,6 +117,7 @@ ALL_EXES=(
     "${MPI_BASE}" "${MPI_ORACLE}" "${MPI_CAL}" "${MPI_OFF}" "${MPI_ONL}" "${MPI_CMP}"
     "${BW_BASE}" "${SM_BASE}" "${BW_WCAL}" "${SM_WCAL}"
     "${BW_ADP}" "${SM_ADP}" "${BW_PROF}" "${SM_PROF}"
+    "${BW_RES}" "${SM_RES}"
 )
 for exe in "${ALL_EXES[@]}"; do
     [[ -x "${exe}" ]] || { echo "ERRO: executavel ausente: ${exe}" >&2; exit 4; }
@@ -250,8 +254,33 @@ for threads in "${THREADS_LIST[@]}"; do
     echo "--- busy-wait WAIT model ---"; cat "${bw_wait}"
     echo "--- semaphore WAIT model ---"; cat "${sm_wait}"
 
+    recompute_ticks="$(awk '$1 == "recompute_ticks" {print $2; exit}' "${pr_model}")"
+    [[ -n "${recompute_ticks}" ]] || { echo "ERRO: recompute_ticks ausente em ${pr_model}." >&2; exit 12; }
+
     # -------------------------------------------------------------------------
-    # Diagnostic profile: not included in benchmark timing.
+    # Residual-WAIT profile of the original baselines. These diagnostic runs
+    # are NOT included in benchmark timing. Raw miss samples are kept so that
+    # the residual-wait distribution can be re-analysed without rerunning.
+    # -------------------------------------------------------------------------
+    echo "[diagnostic] busy-wait residual WAIT"
+    run_plain "${BW_RES}" "${pdir}/diagnostic_busywait_residual.log" \
+        HEAT2D_RECOMPUTE_CYCLES="${recompute_ticks}" \
+        HEAT2D_RESIDUAL_FILE="${pdir}/residual_wait_busywait.csv"
+
+    echo "[diagnostic] semaphore residual WAIT"
+    run_plain "${SM_RES}" "${pdir}/diagnostic_semaphore_residual.log" \
+        HEAT2D_RECOMPUTE_CYCLES="${recompute_ticks}" \
+        HEAT2D_RESIDUAL_FILE="${pdir}/residual_wait_semaphore.csv"
+
+    echo "Busy-wait residual WAIT:"
+    grep -E '^Residual (dependencies total:|immediate ready:|initial misses:|miss fraction:|wait (min:|mean:|p50:|p75:|p90:|p95:|p99:|max:)|recompute threshold:|waits below RECOMPUTE fraction:|waits >= RECOMPUTE fraction:)' \
+        "${pdir}/diagnostic_busywait_residual.log" || true
+    echo "Semaphore residual WAIT:"
+    grep -E '^Residual (dependencies total:|immediate ready:|initial misses:|miss fraction:|wait (min:|mean:|p50:|p75:|p90:|p95:|p99:|max:)|recompute threshold:|waits below RECOMPUTE fraction:|waits >= RECOMPUTE fraction:)' \
+        "${pdir}/diagnostic_semaphore_residual.log" || true
+
+    # -------------------------------------------------------------------------
+    # Adaptive-action diagnostic profile: not included in benchmark timing.
     # -------------------------------------------------------------------------
     echo "[diagnostic] busywait adaptive actions"
     run_plain "${BW_PROF}" "${pdir}/diagnostic_busywait_adaptive.log" \
