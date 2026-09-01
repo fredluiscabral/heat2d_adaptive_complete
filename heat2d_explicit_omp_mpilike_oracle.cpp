@@ -1,8 +1,13 @@
-// heat2d_explicit_omp_mpilike.cpp
+// heat2d_explicit_omp_mpilike_oracle.cpp
 // Equação do calor 2D — método totalmente explícito FTCS.
-// OpenMP MPI-like: cada thread mantém subdomínio local por linhas,
-// com halos norte/sul explícitos copiados diretamente em memória compartilhada.
-// Inclui comparação com solução exata.
+// Referencia "oracle" / compute-only floor para desempenho.
+// Cada thread executa o mesmo kernel FTCS sobre o mesmo subdominio local,
+// mas NAO resolve dependencias entre subdominios: nao ha espera, copia de halo,
+// READ, RECOMPUTE ou PREDICT. Os halos locais permanecem ficticios.
+//
+// IMPORTANTE: esta variante NAO e numericamente valida e nao deve ser usada
+// para comparar erro. Ela fornece apenas um piso empirico otimista do custo
+// computacional quando o custo de resolucao de dependencias e removido.
 
 #include "heat2d_explicit_common.hpp"
 
@@ -14,28 +19,6 @@
 #include <thread>
 #include <vector>
 #include <omp.h>
-
-#if defined(__x86_64__) || defined(__i386__)
-  #include <immintrin.h>
-  static inline void spin_pause() noexcept { _mm_pause(); }
-#else
-  static inline void spin_pause() noexcept { std::this_thread::yield(); }
-#endif
-
-struct alignas(heat2d::CACHELINE_BYTES) ProgressSlot {
-    std::atomic<int> value;
-    char padding[heat2d::CACHELINE_BYTES - sizeof(std::atomic<int>)];
-};
-static_assert(sizeof(ProgressSlot) == heat2d::CACHELINE_BYTES,
-              "ProgressSlot deve ocupar exatamente uma cache line");
-
-static inline void wait_until_at_least(const ProgressSlot& slot, int expected) noexcept {
-    unsigned spins = 0;
-    while (slot.value.load(std::memory_order_acquire) < expected) {
-        spin_pause();
-        if ((++spins & 0x3FFu) == 0u) std::this_thread::yield();
-    }
-}
 
 struct LocalBlock {
     int global_first = 1;
@@ -69,37 +52,6 @@ static inline void initialize_block(LocalBlock& b,
             const double y = static_cast<double>(j) * h;
             b.U0[heat2d::idx2(li, j, b.ld)] = heat2d::exact_solution(x, y, 0.0, p);
         }
-    }
-}
-
-static inline void exchange_halos(std::vector<LocalBlock>& blocks,
-                                  int tid,
-                                  int nt,
-                                  int step,
-                                  int N) {
-    LocalBlock& b = blocks[static_cast<std::size_t>(tid)];
-    double* src = (step & 1) ? b.U1.data() : b.U0.data();
-
-    if (tid > 0) {
-        const LocalBlock& nb = blocks[static_cast<std::size_t>(tid - 1)];
-        const double* nsrc = (step & 1) ? nb.U1.data() : nb.U0.data();
-
-        std::copy_n(nsrc + heat2d::idx2(nb.ni, 0, nb.ld),
-                    static_cast<std::size_t>(N),
-                    src + heat2d::idx2(0, 0, b.ld));
-    } else {
-        std::fill_n(src + heat2d::idx2(0, 0, b.ld), b.ld, 0.0);
-    }
-
-    if (tid + 1 < nt) {
-        const LocalBlock& sb = blocks[static_cast<std::size_t>(tid + 1)];
-        const double* ssrc = (step & 1) ? sb.U1.data() : sb.U0.data();
-
-        std::copy_n(ssrc + heat2d::idx2(1, 0, sb.ld),
-                    static_cast<std::size_t>(N),
-                    src + heat2d::idx2(b.ni + 1, 0, b.ld));
-    } else {
-        std::fill_n(src + heat2d::idx2(b.ni + 1, 0, b.ld), b.ld, 0.0);
     }
 }
 
@@ -190,35 +142,24 @@ int main() {
         initialize_block(blocks[static_cast<std::size_t>(tid)], N, p);
     }
 
-    std::unique_ptr<ProgressSlot[]> progress(new ProgressSlot[static_cast<std::size_t>(max_threads)]);
-    for (int t = 0; t < max_threads; ++t) {
-        progress[static_cast<std::size_t>(t)].value.store(0, std::memory_order_relaxed);
-    }
+    std::cout << "ORACLE WARNING: compute-only performance floor; "
+              << "dependency resolution disabled; numerical result is not valid.\n";
 
     const auto t0 = std::chrono::high_resolution_clock::now();
 
     #pragma omp parallel default(shared)
     {
         const int tid = omp_get_thread_num();
-        const int nt = omp_get_num_threads();
-
-        auto wait_neighbors = [&](int expected) {
-            if (tid > 0)      wait_until_at_least(progress[static_cast<std::size_t>(tid - 1)], expected);
-            if (tid + 1 < nt) wait_until_at_least(progress[static_cast<std::size_t>(tid + 1)], expected);
-        };
+        LocalBlock& b = blocks[static_cast<std::size_t>(tid)];
 
         for (int step = 0; step < T; ++step) {
-            wait_neighbors(step);
-
-            exchange_halos(blocks, tid, nt, step, N);
-
-            LocalBlock& b = blocks[static_cast<std::size_t>(tid)];
             const double* src = (step & 1) ? b.U1.data() : b.U0.data();
             double* dst = (step & 1) ? b.U0.data() : b.U1.data();
 
+            // Nenhuma resolucao de dependencia. Os halos pertencem ao bloco
+            // local e permanecem com os valores ficticios inicializados fora
+            // da regiao temporizada. O trabalho do stencil continua intacto.
             update_block(b, src, dst, N, TILE, lam);
-
-            progress[static_cast<std::size_t>(tid)].value.store(step + 1, std::memory_order_release);
         }
     }
 
@@ -255,7 +196,8 @@ int main() {
 
     const double final_time = static_cast<double>(T) * dt;
     const heat2d::ErrorStats err = heat2d::compute_errors(G.data(), N, global_ld, p, final_time);
-    heat2d::print_summary("omp_mpilike", p, dt, lam, secs, err);
+    std::cout << "Oracle numerical errors below are diagnostic only and have no validity claim.\n";
+    heat2d::print_summary("omp_mpilike_oracle_compute_floor", p, dt, lam, secs, err);
     heat2d::maybe_write_output(p, "output.txt", G.data(), N, global_ld, h);
 
     return 0;

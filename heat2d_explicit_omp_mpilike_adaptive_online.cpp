@@ -1,4 +1,4 @@
-// heat2d_explicit_omp_mpilike_adaptive.cpp
+// heat2d_explicit_omp_mpilike_adaptive_online.cpp
 // Equacao do calor 2D — FTCS totalmente explicito.
 // OpenMP MPI-like com resolucao adaptativa de dependencias:
 // READ / RECOMPUTE / PREDICT / WAIT.
@@ -1468,7 +1468,7 @@ int main() {
     const double final_time = static_cast<double>(T) * dt;
     const heat2d::ErrorStats err = heat2d::compute_errors(G.data(), N, global_ld, p, final_time);
     heat2d::print_summary("omp_mpilike_adaptive", p, dt, mu, secs, err);
-    //heat2d::write_output("output.txt", G.data(), N, global_ld, h);
+    heat2d::maybe_write_output(p, "output.txt", G.data(), N, global_ld, h);
 
     return 0;
 }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -25,6 +26,7 @@ struct Params {
     int TILE = 32;         // tile espacial
     double alpha = 0.1;    // difusividade termica
     double theta = 0.9;    // fracao do limite CFL do FTCS 2D: mu=theta/4
+    bool write_output = false; // escreve o campo final em output.txt
 };
 
 struct Range {
@@ -154,6 +156,22 @@ inline bool parse_double_strict(const std::string& text, double& value) {
     return true;
 }
 
+inline bool parse_bool_strict(const std::string& text, bool& value) {
+    std::string v = trim_copy(text);
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (v == "1" || v == "true" || v == "on" || v == "yes") {
+        value = true;
+        return true;
+    }
+    if (v == "0" || v == "false" || v == "off" || v == "no") {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
 inline bool load_params_strict(const char* filename, Params& p) {
     std::ifstream in(filename);
     if (!in) {
@@ -205,7 +223,8 @@ inline bool load_params_strict(const char* filename, Params& p) {
 
     for (const auto& it : kv) {
         const std::string& key = it.first;
-        if (key != "N" && key != "T" && key != "TILE" && key != "alpha" && key != "theta") {
+        if (key != "N" && key != "T" && key != "TILE" && key != "alpha" && key != "theta" &&
+            key != "WRITE_OUTPUT") {
             std::cerr << "Erro: parametro desconhecido em " << filename
                       << ": " << key << "\n";
             return false;
@@ -218,6 +237,14 @@ inline bool load_params_strict(const char* filename, Params& p) {
         !parse_double_strict(kv["alpha"], p.alpha) ||
         !parse_double_strict(kv["theta"], p.theta)) {
         std::cerr << "Erro: valor invalido em " << filename << ".\n";
+        return false;
+    }
+
+    // WRITE_OUTPUT e opcional para manter compatibilidade com param.txt antigos.
+    // Se ausente, permanece false: testes de desempenho nao fazem I/O pesado por padrao.
+    const auto write_it = kv.find("WRITE_OUTPUT");
+    if (write_it != kv.end() && !parse_bool_strict(write_it->second, p.write_output)) {
+        std::cerr << "Erro: WRITE_OUTPUT deve ser 0/1, false/true, off/on ou no/yes.\n";
         return false;
     }
 
@@ -315,6 +342,7 @@ inline void print_summary(const char* variant,
               << "dt: " << dt << '\n'
               << "mu: " << mu << '\n'
               << "final_time: " << static_cast<double>(p.T) * dt << '\n'
+              << "WRITE_OUTPUT: " << (p.write_output ? "on" : "off") << '\n'
               << "Tempo : " << seconds << " s\n"
               << "L1_mean: " << e.l1 << '\n'
               << "L2_rms: " << e.l2 << '\n'
@@ -343,6 +371,16 @@ inline bool write_output(const char* filename,
         out << '\n';
     }
     return true;
+}
+
+inline bool maybe_write_output(const Params& p,
+                               const char* filename,
+                               const double* U,
+                               int N,
+                               std::size_t ld,
+                               double h) {
+    if (!p.write_output) return true;
+    return write_output(filename, U, N, ld, h);
 }
 
 } // namespace heat2d
