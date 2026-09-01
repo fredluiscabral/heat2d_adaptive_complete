@@ -32,3 +32,7 @@ convergence_results/
 /heat2d_explicit_omp_sem_nobarrier_nofs
 /heat2d_wait_calibrate_busywait
 /heat2d_wait_calibrate_sem
+/heat2d_progress_profile_busywait_baseline
+/heat2d_progress_profile_sem_baseline
+/heat2d_progress_profile_busywait_adaptive
+/heat2d_progress_profile_sem_adaptive

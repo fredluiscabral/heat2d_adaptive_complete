@@ -26,9 +26,14 @@ set -euo pipefail
 #     ./heat2d_adaptive_sem_profile
 #     ./heat2d_residual_profile_busywait
 #     ./heat2d_residual_profile_sem
+#   progress-skew diagnostic builds:
+#     ./heat2d_progress_profile_busywait_baseline
+#     ./heat2d_progress_profile_sem_baseline
+#     ./heat2d_progress_profile_busywait_adaptive
+#     ./heat2d_progress_profile_sem_adaptive
 #
 # Smoke stage:
-#   - builds and runs all 16 executables;
+#   - builds and runs all 20 executables;
 #   - checks WRITE_OUTPUT=0 for every execution;
 #   - checks generation of all three cost-model files;
 #   - checks that profile binaries report READ/RECOMPUTE/PREDICT/WAIT actions.
@@ -78,6 +83,10 @@ BW_PROF="${BW_PROF:-./heat2d_adaptive_busywait_profile}"
 SM_PROF="${SM_PROF:-./heat2d_adaptive_sem_profile}"
 BW_RES="${BW_RES:-./heat2d_residual_profile_busywait}"
 SM_RES="${SM_RES:-./heat2d_residual_profile_sem}"
+BW_PSK_BASE="${BW_PSK_BASE:-./heat2d_progress_profile_busywait_baseline}"
+SM_PSK_BASE="${SM_PSK_BASE:-./heat2d_progress_profile_sem_baseline}"
+BW_PSK_ADP="${BW_PSK_ADP:-./heat2d_progress_profile_busywait_adaptive}"
+SM_PSK_ADP="${SM_PSK_ADP:-./heat2d_progress_profile_sem_adaptive}"
 
 COST_MODEL="${COST_MODEL:-heat2d_cost_model.dat}"
 BW_WAIT_MODEL="${BW_WAIT_MODEL:-heat2d_wait_cost_busywait.dat}"
@@ -193,6 +202,7 @@ ALL_EXES=(
     "${BW_BASE}" "${SM_BASE}" "${BW_WCAL}" "${SM_WCAL}"
     "${BW_ADP}" "${SM_ADP}" "${BW_PROF}" "${SM_PROF}"
     "${BW_RES}" "${SM_RES}"
+    "${BW_PSK_BASE}" "${SM_PSK_BASE}" "${BW_PSK_ADP}" "${SM_PSK_ADP}"
 )
 for exe in "${ALL_EXES[@]}"; do
     if [[ ! -x "${exe}" ]]; then
@@ -217,7 +227,7 @@ echo "OMP_PROC_BIND  : ${OMP_PROC_BIND}"
 # =============================================================================
 echo
 echo "============================================================"
-echo "COMPLETE SMOKE TEST - 16 EXECUTABLES"
+echo "COMPLETE SMOKE TEST - 20 EXECUTABLES"
 echo "============================================================"
 
 set_param N "${SMOKE_N}"
@@ -230,7 +240,7 @@ rm -f "${COST_MODEL}" "${BW_WAIT_MODEL}" "${SM_WAIT_MODEL}" output.txt adaptive_
 echo "N=${SMOKE_N} T=${SMOKE_T} TILE=${SMOKE_TILE} WRITE_OUTPUT=0"
 
 step=0
-TOTAL=16
+TOTAL=20
 announce() { step=$((step+1)); printf '[%02d/%02d] %s\n' "${step}" "${TOTAL}" "$1"; }
 
 announce "MPI-like baseline"
@@ -331,6 +341,36 @@ require_solver_metrics "${OUTDIR}/smoke_semaphore_profile.log"
 for key in "Adaptive actions READ" "Adaptive actions RECOMPUTE" "Adaptive actions PREDICT" "Adaptive actions WAIT"; do
     require_scalar "${key}" "${OUTDIR}/smoke_semaphore_profile.log" >/dev/null
 done
+
+announce "busy-wait baseline progress profile"
+run_logged "${BW_PSK_BASE}" "${OUTDIR}/smoke_progress_busywait_baseline.log" \
+    HEAT2D_PROGRESS_SUMMARY_FILE="${OUTDIR}/smoke_progress_busywait_baseline_summary.csv" \
+    HEAT2D_PROGRESS_WINDOWS_FILE="${OUTDIR}/smoke_progress_busywait_baseline_windows.csv"
+require_solver_metrics "${OUTDIR}/smoke_progress_busywait_baseline.log"
+require_scalar "Progress neighbor rms normalized" "${OUTDIR}/smoke_progress_busywait_baseline.log" >/dev/null
+
+announce "semaphore baseline progress profile"
+run_logged "${SM_PSK_BASE}" "${OUTDIR}/smoke_progress_semaphore_baseline.log" \
+    HEAT2D_PROGRESS_SUMMARY_FILE="${OUTDIR}/smoke_progress_semaphore_baseline_summary.csv" \
+    HEAT2D_PROGRESS_WINDOWS_FILE="${OUTDIR}/smoke_progress_semaphore_baseline_windows.csv"
+require_solver_metrics "${OUTDIR}/smoke_progress_semaphore_baseline.log"
+require_scalar "Progress neighbor rms normalized" "${OUTDIR}/smoke_progress_semaphore_baseline.log" >/dev/null
+
+announce "busy-wait adaptive progress profile"
+run_logged "${BW_PSK_ADP}" "${OUTDIR}/smoke_progress_busywait_adaptive.log" \
+    HEAT2D_COST_FILE="${COST_MODEL}" HEAT2D_WAIT_COST_FILE="${BW_WAIT_MODEL}" \
+    HEAT2D_ENABLE_PREDICT=0 HEAT2D_PROGRESS_SUMMARY_FILE="${OUTDIR}/smoke_progress_busywait_adaptive_summary.csv" \
+    HEAT2D_PROGRESS_WINDOWS_FILE="${OUTDIR}/smoke_progress_busywait_adaptive_windows.csv"
+require_solver_metrics "${OUTDIR}/smoke_progress_busywait_adaptive.log"
+require_scalar "Progress neighbor rms normalized" "${OUTDIR}/smoke_progress_busywait_adaptive.log" >/dev/null
+
+announce "semaphore adaptive progress profile"
+run_logged "${SM_PSK_ADP}" "${OUTDIR}/smoke_progress_semaphore_adaptive.log" \
+    HEAT2D_COST_FILE="${COST_MODEL}" HEAT2D_WAIT_COST_FILE="${SM_WAIT_MODEL}" \
+    HEAT2D_ENABLE_PREDICT=0 HEAT2D_PROGRESS_SUMMARY_FILE="${OUTDIR}/smoke_progress_semaphore_adaptive_summary.csv" \
+    HEAT2D_PROGRESS_WINDOWS_FILE="${OUTDIR}/smoke_progress_semaphore_adaptive_windows.csv"
+require_solver_metrics "${OUTDIR}/smoke_progress_semaphore_adaptive.log"
+require_scalar "Progress neighbor rms normalized" "${OUTDIR}/smoke_progress_semaphore_adaptive.log" >/dev/null
 
 echo
 echo "COMPLETE SMOKE TEST: PASS"

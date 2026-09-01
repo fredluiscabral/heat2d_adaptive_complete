@@ -4,6 +4,7 @@ LDFLAGS  := -fopenmp -pthread
 
 COMMON := heat2d_explicit_common.hpp
 PROFILE_COMMON := heat2d_residual_wait_profile.hpp
+PROGRESS_COMMON := heat2d_progress_trace.hpp
 
 # -----------------------------------------------------------------------------
 # Current MPI-like study
@@ -54,7 +55,20 @@ SM_RES_SRC := heat2d_explicit_omp_sem_nobarrier_nofs_residual_profile.cpp
 BW_RES_BIN := heat2d_residual_profile_busywait
 SM_RES_BIN := heat2d_residual_profile_sem
 
-.PHONY: all current baselines calibrators adaptive diagnostics clean
+# -----------------------------------------------------------------------------
+# Progress-skew diagnostics
+# -----------------------------------------------------------------------------
+BW_PSK_BASE_SRC := heat2d_explicit_omp_busywait_nobarrier_nofs_progress_profile.cpp
+SM_PSK_BASE_SRC := heat2d_explicit_omp_sem_nobarrier_nofs_progress_profile.cpp
+BW_PSK_ADP_SRC  := heat2d_explicit_omp_busywait_nobarrier_nofs_adaptive_progress_profile.cpp
+SM_PSK_ADP_SRC  := heat2d_explicit_omp_sem_nobarrier_nofs_adaptive_progress_profile.cpp
+
+BW_PSK_BASE_BIN := heat2d_progress_profile_busywait_baseline
+SM_PSK_BASE_BIN := heat2d_progress_profile_sem_baseline
+BW_PSK_ADP_BIN  := heat2d_progress_profile_busywait_adaptive
+SM_PSK_ADP_BIN  := heat2d_progress_profile_sem_adaptive
+
+.PHONY: all current baselines calibrators adaptive diagnostics progress_diagnostics clean
 
 all: current baselines calibrators adaptive diagnostics
 
@@ -62,7 +76,9 @@ current: $(MPI_BASE_BIN) $(MPI_ORCL_BIN) $(MPI_CAL_BIN) $(MPI_OFF_BIN) $(MPI_ONL
 baselines: $(BW_BASE_BIN) $(SM_BASE_BIN)
 calibrators: $(BW_WCAL_BIN) $(SM_WCAL_BIN)
 adaptive: $(BW_ADP_BIN) $(SM_ADP_BIN)
-diagnostics: $(BW_PROF_BIN) $(SM_PROF_BIN) $(BW_RES_BIN) $(SM_RES_BIN)
+diagnostics: $(BW_PROF_BIN) $(SM_PROF_BIN) $(BW_RES_BIN) $(SM_RES_BIN) progress_diagnostics
+
+progress_diagnostics: $(BW_PSK_BASE_BIN) $(SM_PSK_BASE_BIN) $(BW_PSK_ADP_BIN) $(SM_PSK_ADP_BIN)
 
 $(MPI_BASE_BIN): $(MPI_BASE_SRC) $(COMMON)
 	$(CXX) $(CXXFLAGS) $(MPI_BASE_SRC) -o $@ $(LDFLAGS)
@@ -112,9 +128,22 @@ $(BW_RES_BIN): $(BW_RES_SRC) $(COMMON) $(PROFILE_COMMON)
 $(SM_RES_BIN): $(SM_RES_SRC) $(COMMON) $(PROFILE_COMMON)
 	$(CXX) $(CXXFLAGS) $(SM_RES_SRC) -o $@ $(LDFLAGS)
 
+$(BW_PSK_BASE_BIN): $(BW_PSK_BASE_SRC) $(COMMON) $(PROGRESS_COMMON)
+	$(CXX) $(CXXFLAGS) $(BW_PSK_BASE_SRC) -o $@ $(LDFLAGS)
+
+$(SM_PSK_BASE_BIN): $(SM_PSK_BASE_SRC) $(COMMON) $(PROGRESS_COMMON)
+	$(CXX) $(CXXFLAGS) $(SM_PSK_BASE_SRC) -o $@ $(LDFLAGS)
+
+$(BW_PSK_ADP_BIN): $(BW_PSK_ADP_SRC) $(COMMON) $(PROGRESS_COMMON)
+	$(CXX) $(CXXFLAGS) -DHEAT2D_PROFILE_STATS=1 $(BW_PSK_ADP_SRC) -o $@ $(LDFLAGS)
+
+$(SM_PSK_ADP_BIN): $(SM_PSK_ADP_SRC) $(COMMON) $(PROGRESS_COMMON)
+	$(CXX) $(CXXFLAGS) -DHEAT2D_PROFILE_STATS=1 $(SM_PSK_ADP_SRC) -o $@ $(LDFLAGS)
+
 clean:
 	rm -f $(MPI_BASE_BIN) $(MPI_ORCL_BIN) $(MPI_CAL_BIN) $(MPI_OFF_BIN) $(MPI_ONL_BIN) $(MPI_CMP_BIN)
 	rm -f $(BW_BASE_BIN) $(SM_BASE_BIN) $(BW_WCAL_BIN) $(SM_WCAL_BIN)
 	rm -f $(BW_ADP_BIN) $(SM_ADP_BIN) $(BW_PROF_BIN) $(SM_PROF_BIN) $(BW_RES_BIN) $(SM_RES_BIN)
+	rm -f $(BW_PSK_BASE_BIN) $(SM_PSK_BASE_BIN) $(BW_PSK_ADP_BIN) $(SM_PSK_ADP_BIN)
 	rm -f heat2d_cost_model.dat heat2d_wait_cost_busywait.dat heat2d_wait_cost_semaphore.dat
-	rm -f output.txt adaptive_stats.txt heat2d_residual_*.csv
+	rm -f output.txt adaptive_stats.txt heat2d_residual_*.csv progress_*.csv
