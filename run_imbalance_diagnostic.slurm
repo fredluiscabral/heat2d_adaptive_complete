@@ -18,7 +18,7 @@ CAL_SAMPLES="${CAL_SAMPLES:-32}"
 WAIT_CAL_SAMPLES="${WAIT_CAL_SAMPLES:-32}"
 PROGRESS_LAMBDA="${PROGRESS_LAMBDA:-1.0}"
 PROGRESS_BOOTSTRAP="${PROGRESS_BOOTSTRAP:-8}"
-OUTDIR="${OUTDIR:-results/criticality_policy}"
+OUTDIR="${OUTDIR:-results/criticality_policy_corrected}"
 
 BW_REF="./heat2d_adaptive_busywait"
 SM_REF="./heat2d_adaptive_sem"
@@ -65,7 +65,7 @@ run_solver() {
     case "${policy}" in
         wait)
             recompute=0
-            criticality=1
+            criticality=0
             ;;
         progress)
             recompute=1

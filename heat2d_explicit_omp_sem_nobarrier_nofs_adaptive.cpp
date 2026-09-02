@@ -727,11 +727,13 @@ static inline ResolveResult resolve_halo(
     // Publica o estado de bloqueio antes da espera. A segunda leitura do
     // progresso reduz a janela em que outro vizinho poderia observar um
     // bloqueio que ja deixou de existir.
-    blocked_on[static_cast<std::size_t>(tid)].value.store(nb,std::memory_order_release);
+    if (cfg.enable_criticality)
+        blocked_on[static_cast<std::size_t>(tid)].value.store(nb,std::memory_order_release);
     if (progress[static_cast<std::size_t>(nb)].value.load(std::memory_order_acquire)<level) {
         wait_backend.wait_until_at_least(progress,tid,nb,level);
     }
-    blocked_on[static_cast<std::size_t>(tid)].value.store(-1,std::memory_order_release);
+    if (cfg.enable_criticality)
+        blocked_on[static_cast<std::size_t>(tid)].value.store(-1,std::memory_order_release);
     const InterfaceSlot* exact=history[static_cast<std::size_t>(nb)].side(remote_side).get(level);
     if (!exact) {
         std::cerr << "Erro interno: snapshot nivel " << level << " do vizinho " << nb
@@ -853,7 +855,9 @@ int main() {
     }
 
     std::vector<ProgressSlot> progress(static_cast<std::size_t>(ntmax));
-    std::vector<BlockedSlot> blocked_on(static_cast<std::size_t>(ntmax));
+    // blocked_on[] so existe em tamanho completo quando a politica de
+    // criticidade esta ativa. WAIT e progress-aware nao pagam seu footprint.
+    std::vector<BlockedSlot> blocked_on(static_cast<std::size_t>(cfg.enable_criticality ? ntmax : 1));
     std::vector<ThreadHistory> history(static_cast<std::size_t>(ntmax));
     std::vector<ThreadWorkspace> workspace(static_cast<std::size_t>(ntmax));
     std::vector<ThreadStats> stats(static_cast<std::size_t>(ntmax));
@@ -861,7 +865,8 @@ int main() {
     #pragma omp parallel for schedule(static)
     for (int t=0;t<ntmax;++t) {
         progress[static_cast<std::size_t>(t)].value.store(0,std::memory_order_relaxed);
-        blocked_on[static_cast<std::size_t>(t)].value.store(-1,std::memory_order_relaxed);
+        if (cfg.enable_criticality)
+            blocked_on[static_cast<std::size_t>(t)].value.store(-1,std::memory_order_relaxed);
         history[static_cast<std::size_t>(t)].allocate(N);
         workspace[static_cast<std::size_t>(t)].allocate(N);
     }
@@ -891,10 +896,12 @@ int main() {
                 const std::uint64_t tguard0=need_ticks?progress_ticks_begin():0;
                 bool w=false;
                 if (progress[static_cast<std::size_t>(nb)].value.load(std::memory_order_acquire)<min_level) {
-                    blocked_on[static_cast<std::size_t>(tid)].value.store(nb,std::memory_order_release);
+                    if (cfg.enable_criticality)
+                        blocked_on[static_cast<std::size_t>(tid)].value.store(nb,std::memory_order_release);
                     if (progress[static_cast<std::size_t>(nb)].value.load(std::memory_order_acquire)<min_level)
                         w=wait_backend.wait_until_at_least(progress,tid,nb,min_level);
-                    blocked_on[static_cast<std::size_t>(tid)].value.store(-1,std::memory_order_release);
+                    if (cfg.enable_criticality)
+                        blocked_on[static_cast<std::size_t>(tid)].value.store(-1,std::memory_order_release);
                 }
                 const std::uint64_t ticks=(need_ticks && w)?(progress_ticks_end()-tguard0):0;
 
