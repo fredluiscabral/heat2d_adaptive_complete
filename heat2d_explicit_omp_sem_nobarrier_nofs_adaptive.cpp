@@ -13,15 +13,16 @@
 // heat2d_dependency_calibrate. O custo de WAIT e lido de um modelo especifico
 // do backend, produzido por heat2d_wait_calibrate_semaphore.
 //
-// Politica de custo quando a dependencia corrente nao esta em READ:
-//   C_F = min(C_R, C_W) se RECOMPUTE estiver disponivel; caso contrario C_F=C_W.
-//   Tentar PREDICT somente se margin*C_tryP < a*C_F.
-//   Se PREDICT for rejeitado, usar a alternativa de menor custo entre R e W.
+// Politica progress-aware:
+//   C_R,eff = C_R + lambda * C_progress_hat.
+// C_progress_hat e a media online, por thread e por vizinho, do custo de
+// lead-guard observado no passo seguinte a um bypass local (RECOMPUTE/PREDICT).
+// Amostras sem espera entram como custo zero. O custo so passa a influenciar
+// a decisao apos HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES observacoes.
 //
-// PREDICT continua sujeito ao orcamento numerico:
-//   E_sync <= eta * B_method.
-//
-// O caminho medido nao usa aprendizado online nem RDTSC/RDTSCP.
+// A decisao RECOMPUTE/WAIT usa C_R,eff < C_W. PREDICT continua sujeito ao
+// orcamento numerico E_sync <= eta*B_method e seu teste de custo inclui o
+// custo de progresso esperado quando a predicao e aceita.
 
 #include "heat2d_explicit_common.hpp"
 
@@ -51,8 +52,24 @@ static_assert(HEAT2D_PROFILE_STATS == 0 || HEAT2D_PROFILE_STATS == 1,
 #if defined(__x86_64__) || defined(__i386__)
   #include <immintrin.h>
   static inline void spin_pause() noexcept { _mm_pause(); }
+  static inline std::uint64_t progress_ticks_begin() noexcept {
+      _mm_lfence();
+      return __rdtsc();
+  }
+  static inline std::uint64_t progress_ticks_end() noexcept {
+      unsigned aux = 0;
+      const std::uint64_t t = __rdtscp(&aux);
+      _mm_lfence();
+      return t;
+  }
 #else
   static inline void spin_pause() noexcept { std::this_thread::yield(); }
+  static inline std::uint64_t progress_ticks_begin() noexcept {
+      return static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count());
+  }
+  static inline std::uint64_t progress_ticks_end() noexcept { return progress_ticks_begin(); }
 #endif
 
 namespace adaptive_shared {
@@ -91,6 +108,8 @@ struct Config {
     bool enable_predict = true;
     bool enable_recompute = true;
     int max_lead = 2;
+    double progress_lambda = 1.0;
+    int progress_bootstrap_samples = 8;
 
     std::string pr_cost_file = "heat2d_cost_model.dat";
     std::string wait_cost_file = "heat2d_wait_cost_semaphore.dat";
@@ -124,10 +143,14 @@ struct Config {
         c.enable_predict = getenv_int("HEAT2D_ENABLE_PREDICT", 1) != 0;
         c.enable_recompute = getenv_int("HEAT2D_ENABLE_RECOMPUTE", 1) != 0;
         c.max_lead = getenv_int("HEAT2D_MAX_LEAD", 2);
+        c.progress_lambda = getenv_double("HEAT2D_PROGRESS_LAMBDA", c.progress_lambda);
+        c.progress_bootstrap_samples = getenv_int("HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES", c.progress_bootstrap_samples);
         if (c.eta < 0.0) c.eta = 0.0;
         if (!(c.kappa > 0.0)) c.kappa = 1.0;
         if (c.budget_floor < 0.0) c.budget_floor = 0.0;
         if (!(c.cost_predict_margin > 0.0)) c.cost_predict_margin = 1.0;
+        if (!(c.progress_lambda >= 0.0) || !std::isfinite(c.progress_lambda)) c.progress_lambda = 1.0;
+        if (c.progress_bootstrap_samples < 1) c.progress_bootstrap_samples = 1;
         if (c.max_lead != 2) {
             std::cerr << "Aviso: HEAT2D_MAX_LEAD=" << c.max_lead
                       << " nao e suportado; usando 2.\n";
@@ -331,8 +354,31 @@ struct ThreadHistory {
     const SideHistory& side(Side s) const noexcept { return s == Side::North ? north : south; }
 };
 
+struct ProgressPenaltyModel {
+    std::uint64_t samples = 0;
+    std::uint64_t nonzero_samples = 0;
+    long double sum_ticks = 0.0L;
+    bool pending = false;
+
+    void observe(std::uint64_t ticks) noexcept {
+        ++samples;
+        if (ticks > 0) ++nonzero_samples;
+        sum_ticks += static_cast<long double>(ticks);
+    }
+    double mean_ticks() const noexcept {
+        return samples ? static_cast<double>(sum_ticks / static_cast<long double>(samples)) : 0.0;
+    }
+    double estimate_ticks(int bootstrap_samples) const noexcept {
+        return samples >= static_cast<std::uint64_t>(bootstrap_samples) ? mean_ticks() : 0.0;
+    }
+};
+
 struct alignas(heat2d::CACHELINE_BYTES) ThreadStats {
     std::uint64_t read=0, recompute=0, predict=0, wait=0, lead_wait=0, predict_rejected=0;
+    std::uint64_t recompute_blocked_progress=0;
+    std::uint64_t progress_penalty_samples=0, progress_penalty_nonzero=0;
+    long double progress_penalty_ticks_sum=0.0L;
+    std::uint64_t lead_wait_ticks_sum=0;
     double max_ratio_accepted=0.0, sum_ratio_accepted=0.0;
     std::uint64_t ratio_samples_accepted=0;
     double max_ratio_rejected=0.0, sum_ratio_rejected=0.0;
@@ -349,6 +395,10 @@ struct alignas(heat2d::CACHELINE_BYTES) ThreadStats {
 
 struct ThreadWorkspace {
     std::vector<double> north_halo, south_halo, Pnorth, Psouth, Dcombined, zero_line;
+    ProgressPenaltyModel north_progress, south_progress;
+    ProgressPenaltyModel& progress_model(Side side) noexcept {
+        return side == Side::North ? north_progress : south_progress;
+    }
     void allocate(int N) {
         north_halo.assign(static_cast<std::size_t>(N), 0.0);
         south_halo.assign(static_cast<std::size_t>(N), 0.0);
@@ -581,13 +631,15 @@ struct ResolveResult {
     double max_ratio=0.0, sum_ratio=0.0;
     std::uint64_t ratio_samples=0;
     bool predict_rejected=false;
+    bool recompute_blocked_by_progress=false;
 };
 
 static inline ResolveResult resolve_halo(
         std::vector<ThreadHistory>& history, const std::vector<Region>& regions,
         const std::vector<ProgressSlot>& progress, WaitBackend& wait_backend,
         int tid, int nt, Side local_side, int level, int N, double mu,
-        const Config& cfg, double* scratch, std::vector<double>& Pbound,
+        const Config& cfg, double progress_penalty_ticks,
+        double* scratch, std::vector<double>& Pbound,
         const double* zero_line) {
     ResolveResult r;
     const int nb=(local_side==Side::North)?tid-1:tid+1;
@@ -605,9 +657,15 @@ static inline ResolveResult resolve_halo(
 
     const double Cw=cfg.wait_ticks;
     const double Cr=cfg.recompute_ticks;
-    const double fallback=rec_ok?std::min(Cr,Cw):Cw;
+    const double Cp=cfg.progress_lambda*progress_penalty_ticks;
+    const double Cr_eff=Cr+Cp;
+    const double fallback=rec_ok?std::min(Cr_eff,Cw):Cw;
+    // Se PREDICT for aceito, ele tambem cria um bypass local e portanto
+    // carrega o mesmo custo de progresso esperado Cp.
+    const double predict_expected_progress=cfg.accept_probability*Cp;
     const bool try_predict=cfg.enable_predict &&
-        cfg.cost_predict_margin*cfg.try_predict_ticks < cfg.accept_probability*fallback;
+        cfg.cost_predict_margin*cfg.try_predict_ticks + predict_expected_progress
+            < cfg.accept_probability*fallback;
 
     if (try_predict) {
         bool evaluated=false;
@@ -620,9 +678,12 @@ static inline ResolveResult resolve_halo(
         if (pred_ok) { r.action=Action::Predict; r.halo=scratch; return r; }
     }
 
-    if (rec_ok && Cr < Cw) {
+    if (rec_ok && Cr_eff < Cw) {
         if (!recompute_remote_boundary(rv,N,mu,scratch)) std::abort();
         r.action=Action::Recompute; r.halo=scratch; return r;
+    }
+    if (rec_ok && Cr < Cw && Cr_eff >= Cw) {
+        r.recompute_blocked_by_progress=true;
     }
 
     wait_backend.wait_until_at_least(progress,tid,nb,level);
@@ -670,6 +731,9 @@ static void print_config(const Config& c, double mu) {
               << "Adaptive predict: " << (c.enable_predict?"on":"off") << '\n'
               << "Adaptive recompute: " << (c.enable_recompute?"on":"off") << '\n'
               << "Adaptive max lead: " << c.max_lead << '\n'
+              << "Adaptive progress-aware: on\n"
+              << "Adaptive progress lambda: " << c.progress_lambda << '\n'
+              << "Adaptive progress bootstrap samples: " << c.progress_bootstrap_samples << '\n'
               << "Adaptive P/R cost file: " << c.pr_cost_file << '\n'
               << "Adaptive WAIT cost file: " << c.wait_cost_file << '\n'
               << "Adaptive try-PREDICT: " << c.try_predict_ticks << ' ' << c.tick_unit << '\n'
@@ -772,27 +836,51 @@ int main() {
 
         for (int step=0;step<T;++step) {
             const int min_level=step+1-cfg.max_lead;
-            if (tid>0) {
-                const bool w=wait_backend.wait_until_at_least(progress,tid,tid-1,min_level);
-                if constexpr (PROFILE_STATS_ENABLED) if (w) ++st.lead_wait;
-            }
-            if (tid+1<nt) {
-                const bool w=wait_backend.wait_until_at_least(progress,tid,tid+1,min_level);
-                if constexpr (PROFILE_STATS_ENABLED) if (w) ++st.lead_wait;
-            }
+
+            auto settle_lead_guard=[&](Side side, int nb) {
+                ProgressPenaltyModel& pm=ws.progress_model(side);
+                const bool need_ticks=pm.pending || PROFILE_STATS_ENABLED;
+                const std::uint64_t tguard0=need_ticks?progress_ticks_begin():0;
+                const bool w=wait_backend.wait_until_at_least(progress,tid,nb,min_level);
+                const std::uint64_t ticks=(need_ticks && w)?(progress_ticks_end()-tguard0):0;
+
+                if (pm.pending) {
+                    pm.observe(ticks);
+                    if constexpr (PROFILE_STATS_ENABLED) {
+                        ++st.progress_penalty_samples;
+                        if (ticks>0) ++st.progress_penalty_nonzero;
+                        st.progress_penalty_ticks_sum += static_cast<long double>(ticks);
+                    }
+                    pm.pending=false;
+                }
+                if constexpr (PROFILE_STATS_ENABLED) {
+                    if (w) { ++st.lead_wait; st.lead_wait_ticks_sum += ticks; }
+                }
+            };
+
+            if (tid>0) settle_lead_guard(Side::North,tid-1);
+            if (tid+1<nt) settle_lead_guard(Side::South,tid+1);
 
             const double* src=(step&1)?U1.data():U0.data();
             double* dst=(step&1)?U0.data():U1.data();
 
+            const double north_penalty=ws.north_progress.estimate_ticks(cfg.progress_bootstrap_samples);
+            const double south_penalty=ws.south_progress.estimate_ticks(cfg.progress_bootstrap_samples);
             ResolveResult rn=resolve_halo(history,regions,progress,wait_backend,tid,nt,Side::North,
-                step,N,mu,cfg,ws.north_halo.data(),ws.Pnorth,ws.zero_line.data());
+                step,N,mu,cfg,north_penalty,ws.north_halo.data(),ws.Pnorth,ws.zero_line.data());
             ResolveResult rs=resolve_halo(history,regions,progress,wait_backend,tid,nt,Side::South,
-                step,N,mu,cfg,ws.south_halo.data(),ws.Psouth,ws.zero_line.data());
+                step,N,mu,cfg,south_penalty,ws.south_halo.data(),ws.Psouth,ws.zero_line.data());
+
+            // Um bypass local pode reaparecer como lead-guard no proximo passo.
+            if (rn.action==Action::Recompute || rn.action==Action::Predict) ws.north_progress.pending=true;
+            if (rs.action==Action::Recompute || rs.action==Action::Predict) ws.south_progress.pending=true;
 
             if constexpr (PROFILE_STATS_ENABLED) {
                 st.count(rn.action); st.count(rs.action);
                 if (rn.predict_rejected) ++st.predict_rejected;
                 if (rs.predict_rejected) ++st.predict_rejected;
+                if (rn.recompute_blocked_by_progress) ++st.recompute_blocked_progress;
+                if (rs.recompute_blocked_by_progress) ++st.recompute_blocked_progress;
                 auto acc=[&](const ResolveResult& x) {
                     if (!x.ratio_samples) return;
                     if (x.action==Action::Predict) {
@@ -833,9 +921,14 @@ int main() {
 
     if constexpr (PROFILE_STATS_ENABLED) {
         std::uint64_t rd=0,rc=0,pr=0,wt=0,lw=0,rj=0,sa=0,sr=0;
+        std::uint64_t blocked_progress=0, penalty_samples=0, penalty_nonzero=0, lead_wait_ticks=0;
+        long double penalty_ticks_sum=0.0L;
         double ma=0.0,mr=0.0,xa=0.0,xr=0.0;
         for (const ThreadStats& s:stats) {
             rd+=s.read; rc+=s.recompute; pr+=s.predict; wt+=s.wait; lw+=s.lead_wait; rj+=s.predict_rejected;
+            blocked_progress+=s.recompute_blocked_progress;
+            penalty_samples+=s.progress_penalty_samples; penalty_nonzero+=s.progress_penalty_nonzero;
+            penalty_ticks_sum+=s.progress_penalty_ticks_sum; lead_wait_ticks+=s.lead_wait_ticks_sum;
             sa+=s.ratio_samples_accepted; sr+=s.ratio_samples_rejected;
             ma=std::max(ma,s.max_ratio_accepted); mr=std::max(mr,s.max_ratio_rejected);
             xa+=s.sum_ratio_accepted; xr+=s.sum_ratio_rejected;
@@ -845,6 +938,16 @@ int main() {
                   << "Adaptive actions PREDICT: " << pr << '\n'
                   << "Adaptive actions WAIT: " << wt << '\n'
                   << "Adaptive lead-guard waits: " << lw << '\n'
+                  << "Lead-guard wait ticks sum: " << lead_wait_ticks << '\n'
+                  << "Progress-blocked RECOMPUTE: " << blocked_progress << '\n'
+                  << "Progress penalty samples: " << penalty_samples << '\n'
+                  << "Progress penalty nonzero samples: " << penalty_nonzero << '\n'
+                  << std::setprecision(16)
+                  << "Progress penalty observed mean: "
+                  << (penalty_samples?static_cast<double>(penalty_ticks_sum/static_cast<long double>(penalty_samples)):0.0)
+                  << ' ' << cfg.tick_unit << '\n'
+                  << "Progress penalty nonzero fraction: "
+                  << (penalty_samples?static_cast<double>(penalty_nonzero)/static_cast<double>(penalty_samples):0.0) << '\n'
                   << "Adaptive predict rejected: " << rj << '\n'
                   << std::setprecision(16)
                   << "Accepted PREDICT max Esync/(eta*B): " << ma << '\n'
