@@ -140,7 +140,9 @@ for threads in "${THREADS_LIST[@]}"; do
 
     echo "[calibration] PREDICT/RECOMPUTE"
     rm -f output.txt
-    HEAT2D_CALIBRATION_SAMPLES="${CAL_SAMPLES}" \
+    HEAT2D_ENABLE_PREDICT=1 \
+    HEAT2D_ENABLE_RECOMPUTE=1 \
+    HEAT2D_COST_BOOTSTRAP_SAMPLES="${CAL_SAMPLES}" \
     HEAT2D_COST_FILE="${cost_model}" \
         "${PR_CAL}" > "${pdir}/calibration_pr.log" 2>&1
     rm -f output.txt
