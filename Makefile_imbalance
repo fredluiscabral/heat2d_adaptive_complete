@@ -1,0 +1,42 @@
+CXX ?= g++
+CXXFLAGS ?= -O3 -std=c++17 -fopenmp -pthread
+CPPFLAGS ?=
+PROFILE_FLAGS := -DHEAT2D_PROFILE_STATS=1
+
+COMMON_HDR := heat2d_explicit_common.hpp
+
+BW_SRC := heat2d_explicit_omp_busywait_nobarrier_nofs_adaptive_imbalance.cpp
+SEM_SRC := heat2d_explicit_omp_sem_nobarrier_nofs_adaptive_imbalance.cpp
+PR_CAL_SRC := heat2d_explicit_omp_mpilike_calibrate.cpp
+BW_WAIT_CAL_SRC := heat2d_explicit_omp_busywait_nobarrier_nofs_wait_calibrate.cpp
+SEM_WAIT_CAL_SRC := heat2d_explicit_omp_sem_nobarrier_nofs_wait_calibrate.cpp
+
+BW_EXE := heat2d_imbalance_busywait
+SEM_EXE := heat2d_imbalance_semaphore
+PR_CAL_EXE := heat2d_dependency_calibrate
+BW_WAIT_CAL_EXE := heat2d_wait_calibrate_busywait
+SEM_WAIT_CAL_EXE := heat2d_wait_calibrate_semaphore
+
+TARGETS := $(BW_EXE) $(SEM_EXE) $(PR_CAL_EXE) $(BW_WAIT_CAL_EXE) $(SEM_WAIT_CAL_EXE)
+
+.PHONY: all clean
+
+all: $(TARGETS)
+
+$(BW_EXE): $(BW_SRC) $(COMMON_HDR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(PROFILE_FLAGS) $< -o $@
+
+$(SEM_EXE): $(SEM_SRC) $(COMMON_HDR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(PROFILE_FLAGS) $< -o $@
+
+$(PR_CAL_EXE): $(PR_CAL_SRC) $(COMMON_HDR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(BW_WAIT_CAL_EXE): $(BW_WAIT_CAL_SRC) $(COMMON_HDR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+$(SEM_WAIT_CAL_EXE): $(SEM_WAIT_CAL_SRC) $(COMMON_HDR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
+
+clean:
+	rm -f $(TARGETS)
