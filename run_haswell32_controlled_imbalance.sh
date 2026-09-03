@@ -188,7 +188,7 @@ static inline int synthetic_load_thread_from_env(int nt) noexcept {
     if (const char* s = std::getenv("HEAT2D_SYNTHETIC_THREAD"); s && *s) {
         char* end = nullptr;
         const long x = std::strtol(s, &end, 10);
-        if (end && *end == '\0' && x >= 0 && x < nt)
+        if (end && *end == 0 && x >= 0 && x < nt)
             tid = static_cast<int>(x);
     }
     return tid;
@@ -199,7 +199,7 @@ static inline double synthetic_load_fraction_from_env() noexcept {
     if (const char* s = std::getenv("HEAT2D_SYNTHETIC_LOAD_PCT"); s && *s) {
         char* end = nullptr;
         const double x = std::strtod(s, &end);
-        if (end && *end == '\0' && std::isfinite(x) && x >= 0.0)
+        if (end && *end == 0 && std::isfinite(x) && x >= 0.0)
             pct = x;
     }
     if (pct > 100.0) pct = 100.0;
