@@ -50,7 +50,7 @@ BW_PROF_BIN := heat2d_adaptive_busywait_profile
 SM_PROF_BIN := heat2d_adaptive_sem_profile
 
 # -----------------------------------------------------------------------------
-# Adaptive-V2: online costs + progress penalty + continuous global wait value
+# Adaptive-V2: sparse online costs + sampled progress penalty + continuous global wait value
 # -----------------------------------------------------------------------------
 BW_V2_SRC := heat2d_explicit_omp_busywait_nobarrier_nofs_adaptive_v2.cpp
 SM_V2_SRC := heat2d_explicit_omp_sem_nobarrier_nofs_adaptive_v2.cpp

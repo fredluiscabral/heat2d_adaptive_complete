@@ -18,7 +18,7 @@ set -euo pipefail
 #   BASE     = native no-false-sharing solver
 #   WAIT     = current adaptive infrastructure with RECOMPUTE disabled
 #   CRITICAL = current progress+binary-criticality controller
-#   V2       = online C_R/C_W + progress penalty + continuous phi controller
+#   V2       = sparse-online C_R/C_W + sampled progress penalty + continuous phi
 #
 # Default matrix:
 #   p       = 64 160
@@ -46,13 +46,21 @@ CAL_SAMPLES="${CAL_SAMPLES:-32}"
 WAIT_CAL_SAMPLES="${WAIT_CAL_SAMPLES:-32}"
 
 PROGRESS_LAMBDA="${PROGRESS_LAMBDA:-1.0}"
-PROGRESS_BOOTSTRAP="${PROGRESS_BOOTSTRAP:-8}"
-V2_ONLINE_BETA="${V2_ONLINE_BETA:-0.05}"
-V2_PROGRESS_BETA="${V2_PROGRESS_BETA:-0.05}"
-V2_PHI_BETA="${V2_PHI_BETA:-0.10}"
+CURRENT_PROGRESS_BOOTSTRAP="${CURRENT_PROGRESS_BOOTSTRAP:-8}"
+V2_PROGRESS_BOOTSTRAP="${V2_PROGRESS_BOOTSTRAP:-4}"
+
+# Sparse online adaptation: defaults chosen to keep measurement overhead small.
+V2_ONLINE_BETA="${V2_ONLINE_BETA:-0.20}"
+V2_PROGRESS_BETA="${V2_PROGRESS_BETA:-0.20}"
+V2_PHI_BETA="${V2_PHI_BETA:-0.25}"
 V2_PHI_FLOOR="${V2_PHI_FLOOR:-0.0}"
-V2_PHI_RESAMPLE_PERIOD="${V2_PHI_RESAMPLE_PERIOD:-16}"
-V2_ONLINE_BOOTSTRAP="${V2_ONLINE_BOOTSTRAP:-4}"
+V2_ONLINE_CLIP_FACTOR="${V2_ONLINE_CLIP_FACTOR:-4.0}"
+V2_CR_SAMPLE_PERIOD="${V2_CR_SAMPLE_PERIOD:-32}"
+V2_CW_SAMPLE_PERIOD="${V2_CW_SAMPLE_PERIOD:-32}"
+V2_PROGRESS_SAMPLE_PERIOD="${V2_PROGRESS_SAMPLE_PERIOD:-8}"
+V2_PHI_SAMPLE_PERIOD="${V2_PHI_SAMPLE_PERIOD:-2}"
+V2_PHI_GLOBAL_REFRESH_STEPS="${V2_PHI_GLOBAL_REFRESH_STEPS:-4}"
+V2_TIMER_CALIBRATION_SAMPLES="${V2_TIMER_CALIBRATION_SAMPLES:-128}"
 
 OUTDIR="${OUTDIR:-results/sdumont_adaptive_v2_compare_spread_T500}"
 
@@ -162,7 +170,7 @@ run_current() {
         HEAT2D_COST_FILE="${cost}" \
         HEAT2D_WAIT_COST_FILE="${waitcost}" \
         HEAT2D_PROGRESS_LAMBDA="${PROGRESS_LAMBDA}" \
-        HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES="${PROGRESS_BOOTSTRAP}" \
+        HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES="${CURRENT_PROGRESS_BOOTSTRAP}" \
         "${exe}" > "${log}" 2>&1
 
     check_common_log "${log}" "${threads}"
@@ -189,13 +197,18 @@ run_v2() {
         HEAT2D_COST_FILE="${cost}" \
         HEAT2D_WAIT_COST_FILE="${waitcost}" \
         HEAT2D_PROGRESS_LAMBDA="${PROGRESS_LAMBDA}" \
-        HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES="${PROGRESS_BOOTSTRAP}" \
+        HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES="${V2_PROGRESS_BOOTSTRAP}" \
         HEAT2D_ONLINE_BETA="${V2_ONLINE_BETA}" \
         HEAT2D_PROGRESS_BETA="${V2_PROGRESS_BETA}" \
         HEAT2D_PHI_BETA="${V2_PHI_BETA}" \
         HEAT2D_PHI_FLOOR="${V2_PHI_FLOOR}" \
-        HEAT2D_PHI_RESAMPLE_PERIOD="${V2_PHI_RESAMPLE_PERIOD}" \
-        HEAT2D_ONLINE_BOOTSTRAP_SAMPLES="${V2_ONLINE_BOOTSTRAP}" \
+        HEAT2D_ONLINE_CLIP_FACTOR="${V2_ONLINE_CLIP_FACTOR}" \
+        HEAT2D_CR_SAMPLE_PERIOD="${V2_CR_SAMPLE_PERIOD}" \
+        HEAT2D_CW_SAMPLE_PERIOD="${V2_CW_SAMPLE_PERIOD}" \
+        HEAT2D_PROGRESS_SAMPLE_PERIOD="${V2_PROGRESS_SAMPLE_PERIOD}" \
+        HEAT2D_PHI_SAMPLE_PERIOD="${V2_PHI_SAMPLE_PERIOD}" \
+        HEAT2D_PHI_GLOBAL_REFRESH_STEPS="${V2_PHI_GLOBAL_REFRESH_STEPS}" \
+        HEAT2D_TIMER_CALIBRATION_SAMPLES="${V2_TIMER_CALIBRATION_SAMPLES}" \
         "${exe}" > "${log}" 2>&1
 
     check_common_log "${log}" "${threads}"
@@ -391,7 +404,10 @@ for pdir in sorted(glob.glob(os.path.join(outdir,'threads_*'))):
                     'wait':read_scalar(lines,'Adaptive actions WAIT'),
                     'lead_wait':read_scalar(lines,'Adaptive lead-guard waits'),
                     'lead_wait_ticks_sum':read_scalar(lines,'Lead-guard wait ticks sum'),
+                    'v2_sampled_lead_wait_ticks_sum':read_scalar(lines,'V2 sampled lead-guard wait ticks sum'),
+                    'v2_global_progress_scans':read_scalar(lines,'V2 global progress scans'),
                     'progress_blocked':read_scalar(lines,'Progress-blocked RECOMPUTE'),
+                    'v2_value_blocked':read_scalar(lines,'V2 immediate-value blocked RECOMPUTE'),
                     'critical_recompute':read_scalar(lines,'Critical RECOMPUTE'),
                     'noncritical_recompute_rejected':read_scalar(lines,'Noncritical RECOMPUTE rejected'),
                     'v2_recompute_rejected':read_scalar(lines,'V2 RECOMPUTE rejected by model'),
@@ -405,6 +421,14 @@ for pdir in sorted(glob.glob(os.path.join(outdir,'threads_*'))):
                     'v2_recompute_obs_mean':read_scalar(lines,'V2 observed RECOMPUTE mean'),
                     'v2_wait_obs_samples':read_scalar(lines,'V2 observed WAIT samples'),
                     'v2_wait_obs_mean':read_scalar(lines,'V2 observed WAIT mean'),
+                    'v2_final_cr_hat_mean':read_scalar(lines,'V2 final CR hat mean'),
+                    'v2_final_cw_hat_mean':read_scalar(lines,'V2 final CW hat mean'),
+                    'v2_final_contention_proxy_mean':read_scalar(lines,'V2 final contention proxy mean'),
+                    'v2_final_phi_hat_mean':read_scalar(lines,'V2 final phi hat mean'),
+                    'v2_model_cr_samples':read_scalar(lines,'V2 model CR samples'),
+                    'v2_model_cw_samples':read_scalar(lines,'V2 model CW samples'),
+                    'v2_model_phi_updates':read_scalar(lines,'V2 model phi updates'),
+                    'v2_timer_overhead_ticks':read_scalar(lines,'Adaptive V2 timer overhead'),
                     'penalty_samples':read_scalar(lines,'Progress penalty samples'),
                     'penalty_nonzero_samples':read_scalar(lines,'Progress penalty nonzero samples'),
                     'penalty_mean_ticks':read_scalar(lines,'Progress penalty observed mean'),
@@ -461,13 +485,19 @@ PY
     echo "PREDICT=0"
     echo "HEAT2D_MAX_LEAD=${HEAT2D_MAX_LEAD}"
     echo "PROGRESS_LAMBDA=${PROGRESS_LAMBDA}"
-    echo "PROGRESS_BOOTSTRAP=${PROGRESS_BOOTSTRAP}"
+    echo "CURRENT_PROGRESS_BOOTSTRAP=${CURRENT_PROGRESS_BOOTSTRAP}"
+    echo "V2_PROGRESS_BOOTSTRAP=${V2_PROGRESS_BOOTSTRAP}"
     echo "V2_ONLINE_BETA=${V2_ONLINE_BETA}"
     echo "V2_PROGRESS_BETA=${V2_PROGRESS_BETA}"
     echo "V2_PHI_BETA=${V2_PHI_BETA}"
     echo "V2_PHI_FLOOR=${V2_PHI_FLOOR}"
-    echo "V2_PHI_RESAMPLE_PERIOD=${V2_PHI_RESAMPLE_PERIOD}"
-    echo "V2_ONLINE_BOOTSTRAP=${V2_ONLINE_BOOTSTRAP}"
+    echo "V2_ONLINE_CLIP_FACTOR=${V2_ONLINE_CLIP_FACTOR}"
+    echo "V2_CR_SAMPLE_PERIOD=${V2_CR_SAMPLE_PERIOD}"
+    echo "V2_CW_SAMPLE_PERIOD=${V2_CW_SAMPLE_PERIOD}"
+    echo "V2_PROGRESS_SAMPLE_PERIOD=${V2_PROGRESS_SAMPLE_PERIOD}"
+    echo "V2_PHI_SAMPLE_PERIOD=${V2_PHI_SAMPLE_PERIOD}"
+    echo "V2_PHI_GLOBAL_REFRESH_STEPS=${V2_PHI_GLOBAL_REFRESH_STEPS}"
+    echo "V2_TIMER_CALIBRATION_SAMPLES=${V2_TIMER_CALIBRATION_SAMPLES}"
 } > "${OUTDIR}/run_metadata.txt"
 
 sha256sum \

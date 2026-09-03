@@ -1,27 +1,33 @@
 // heat2d_explicit_omp_sem_nobarrier_nofs_adaptive_v2.cpp
 // Equacao do calor 2D — FTCS totalmente explicito.
-// Adaptive-V2: decisao online READ / RECOMPUTE / PREDICT / WAIT.
+// Adaptive-V2 revisado: READ / RECOMPUTE / PREDICT / WAIT.
 //
 // Backend de WAIT: semaforos POSIX em slots alinhados/padded.
 //
-// O V2 preserva os snapshots versionados, max_lead=2 e a admissibilidade
-// numerica de PREDICT da versao anterior, mas substitui a porta binaria de
-// criticalidade por um modelo continuo de valor global da espera:
+// Principio do V2 revisado:
+//   C_R,obs_hat + lambda*C_progress_hat < phi_hat*C_W_hat
 //
-//   C_R0 + C_contention_hat + lambda*C_progress_hat < phi_hat*C_W_hat
+// C_R,obs_hat e o custo observado de RECOMPUTE e ja incorpora efeitos de
+// contencao presentes no instante da amostra. Portanto NAO somamos novamente
+// um termo C_contention separado: isso duplicaria o mesmo efeito. Para
+// diagnostico, reportamos C_contention_proxy=max(0,C_R,obs_hat-C_R0).
 //
-// onde:
-//   - C_R0 e C_W0 vem da calibracao inicial in situ (arquivos existentes);
-//   - C_R_hat e C_W_hat sao atualizados online por EWMA;
-//   - C_contention_hat = max(0, C_R_hat - C_R0);
-//   - C_progress_hat e aprendido a partir do lead-guard posterior a bypasses;
-//   - phi_hat in [0,1] combina proximidade ao fronte global de progresso e
-//     urgencia do vizinho que depende da thread.
+// Para reduzir o efeito observador:
+//   - C_R e C_W partem da calibracao inicial (C_R0,C_W0);
+//   - somente 1 em K eventos e cronometrado (periodos configuraveis);
+//   - o custo do par de leituras do relogio e calibrado antes da ROI e
+//     subtraido das amostras;
+//   - C_progress tambem e amostrado esparsamente;
+//   - phi nao varre todas as threads a cada dependencia. Uma unica thread,
+//     rotacionada entre epocas, atualiza ocasionalmente um minimo global de
+//     progresso; as demais reutilizam esse snapshot sem barreira.
 //
-// A estimativa de phi usa uma leitura periodica do minimo global de progresso,
-// sem barreira. Entre reamostragens, cada thread reutiliza o ultimo minimo.
-// Esta e uma primeira implementacao operacional do modelo, feita para teste
-// experimental; nao pressupoe que phi_hat seja um estimador final/otimo.
+// A estimativa continua phi in [0,1] combina:
+//   (a) proximidade da thread ao fronte global de progresso; e
+//   (b) urgencia do outro vizinho que pode depender dela.
+//
+// Esta versao preserva snapshots versionados, max_lead=2 e a admissibilidade
+// numerica de PREDICT da versao anterior.
 
 #include "heat2d_explicit_common.hpp"
 
@@ -72,6 +78,25 @@ static_assert(HEAT2D_PROFILE_STATS == 0 || HEAT2D_PROFILE_STATS == 1,
   static inline std::uint64_t progress_ticks_end() noexcept { return progress_ticks_begin(); }
 #endif
 
+
+static inline std::uint64_t subtract_timer_overhead(std::uint64_t raw,
+                                                     std::uint64_t overhead) noexcept {
+    return raw > overhead ? raw - overhead : 0;
+}
+
+static std::uint64_t calibrate_timer_overhead(int samples) {
+    std::vector<std::uint64_t> v;
+    v.reserve(static_cast<std::size_t>(samples));
+    for (int i=0; i<samples; ++i) {
+        const std::uint64_t t0 = progress_ticks_begin();
+        const std::uint64_t t1 = progress_ticks_end();
+        v.push_back(t1 - t0);
+    }
+    std::sort(v.begin(), v.end());
+    // Mediana: mais robusta a interrupcoes ocasionais do que uma unica leitura.
+    return v[v.size()/2];
+}
+
 namespace adaptive_shared {
 
 constexpr bool PROFILE_STATS_ENABLED = (HEAT2D_PROFILE_STATS != 0);
@@ -109,15 +134,23 @@ struct Config {
     bool enable_recompute = true;
     int max_lead = 2;
     double progress_lambda = 1.0;
-    int progress_bootstrap_samples = 8;
-    // Adaptive-V2 online model.
+    int progress_bootstrap_samples = 4;
+
+    // Adaptive-V2 sparse online model.
     bool enable_phi = true;
-    double online_beta = 0.05;
-    double progress_beta = 0.05;
-    double phi_beta = 0.10;
+    double online_beta = 0.20;
+    double progress_beta = 0.20;
+    double phi_beta = 0.25;
     double phi_floor = 0.0;
-    int phi_resample_period = 16;
-    int online_bootstrap_samples = 4;
+    double online_clip_factor = 4.0;
+
+    // 0 desabilita novas amostras online e mantem o valor calibrado/armazenado.
+    int cr_sample_period = 32;
+    int cw_sample_period = 32;
+    int progress_sample_period = 8;
+    int phi_sample_period = 2;
+    int phi_global_refresh_steps = 4;
+    int timer_calibration_samples = 128;
 
     std::string pr_cost_file = "heat2d_cost_model.dat";
     std::string wait_cost_file = "heat2d_wait_cost_semaphore.dat";
@@ -153,26 +186,38 @@ struct Config {
         c.max_lead = getenv_int("HEAT2D_MAX_LEAD", 2);
         c.progress_lambda = getenv_double("HEAT2D_PROGRESS_LAMBDA", c.progress_lambda);
         c.progress_bootstrap_samples = getenv_int("HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES", c.progress_bootstrap_samples);
+
         c.enable_phi = getenv_int("HEAT2D_ENABLE_PHI", 1) != 0;
         c.online_beta = getenv_double("HEAT2D_ONLINE_BETA", c.online_beta);
         c.progress_beta = getenv_double("HEAT2D_PROGRESS_BETA", c.progress_beta);
         c.phi_beta = getenv_double("HEAT2D_PHI_BETA", c.phi_beta);
         c.phi_floor = getenv_double("HEAT2D_PHI_FLOOR", c.phi_floor);
-        c.phi_resample_period = getenv_int("HEAT2D_PHI_RESAMPLE_PERIOD", c.phi_resample_period);
-        c.online_bootstrap_samples = getenv_int("HEAT2D_ONLINE_BOOTSTRAP_SAMPLES", c.online_bootstrap_samples);
+        c.online_clip_factor = getenv_double("HEAT2D_ONLINE_CLIP_FACTOR", c.online_clip_factor);
+        c.cr_sample_period = getenv_int("HEAT2D_CR_SAMPLE_PERIOD", c.cr_sample_period);
+        c.cw_sample_period = getenv_int("HEAT2D_CW_SAMPLE_PERIOD", c.cw_sample_period);
+        c.progress_sample_period = getenv_int("HEAT2D_PROGRESS_SAMPLE_PERIOD", c.progress_sample_period);
+        c.phi_sample_period = getenv_int("HEAT2D_PHI_SAMPLE_PERIOD", c.phi_sample_period);
+        c.phi_global_refresh_steps = getenv_int("HEAT2D_PHI_GLOBAL_REFRESH_STEPS", c.phi_global_refresh_steps);
+        c.timer_calibration_samples = getenv_int("HEAT2D_TIMER_CALIBRATION_SAMPLES", c.timer_calibration_samples);
+
         if (c.eta < 0.0) c.eta = 0.0;
         if (!(c.kappa > 0.0)) c.kappa = 1.0;
         if (c.budget_floor < 0.0) c.budget_floor = 0.0;
         if (!(c.cost_predict_margin > 0.0)) c.cost_predict_margin = 1.0;
         if (!(c.progress_lambda >= 0.0) || !std::isfinite(c.progress_lambda)) c.progress_lambda = 1.0;
         if (c.progress_bootstrap_samples < 1) c.progress_bootstrap_samples = 1;
-        if (!(c.online_beta > 0.0 && c.online_beta <= 1.0)) c.online_beta = 0.05;
-        if (!(c.progress_beta > 0.0 && c.progress_beta <= 1.0)) c.progress_beta = 0.05;
-        if (!(c.phi_beta > 0.0 && c.phi_beta <= 1.0)) c.phi_beta = 0.10;
+        if (!(c.online_beta > 0.0 && c.online_beta <= 1.0)) c.online_beta = 0.20;
+        if (!(c.progress_beta > 0.0 && c.progress_beta <= 1.0)) c.progress_beta = 0.20;
+        if (!(c.phi_beta > 0.0 && c.phi_beta <= 1.0)) c.phi_beta = 0.25;
         if (!std::isfinite(c.phi_floor)) c.phi_floor = 0.0;
         c.phi_floor = std::clamp(c.phi_floor, 0.0, 1.0);
-        if (c.phi_resample_period < 1) c.phi_resample_period = 1;
-        if (c.online_bootstrap_samples < 1) c.online_bootstrap_samples = 1;
+        if (!(c.online_clip_factor >= 1.0) || !std::isfinite(c.online_clip_factor)) c.online_clip_factor = 4.0;
+        c.cr_sample_period = std::max(0, c.cr_sample_period);
+        c.cw_sample_period = std::max(0, c.cw_sample_period);
+        c.progress_sample_period = std::max(0, c.progress_sample_period);
+        c.phi_sample_period = std::max(0, c.phi_sample_period);
+        c.phi_global_refresh_steps = std::max(1, c.phi_global_refresh_steps);
+        c.timer_calibration_samples = std::clamp(c.timer_calibration_samples, 16, 4096);
         if (c.max_lead != 2) {
             std::cerr << "Aviso: HEAT2D_MAX_LEAD=" << c.max_lead
                       << " nao e suportado; usando 2.\n";
@@ -294,6 +339,16 @@ struct alignas(heat2d::CACHELINE_BYTES) BlockedSlot {
 static_assert(sizeof(BlockedSlot) == heat2d::CACHELINE_BYTES,
               "BlockedSlot deve ocupar exatamente uma cache line");
 
+
+struct alignas(heat2d::CACHELINE_BYTES) GlobalProgressSnapshot {
+    std::atomic<int> min_level;
+    char padding[heat2d::CACHELINE_BYTES - sizeof(std::atomic<int>)];
+    GlobalProgressSnapshot() : min_level(0), padding{} {}
+};
+static_assert(sizeof(GlobalProgressSnapshot) == heat2d::CACHELINE_BYTES,
+              "GlobalProgressSnapshot deve ocupar exatamente uma cache line");
+
+
 static_assert(sizeof(sem_t) <= heat2d::CACHELINE_BYTES,
               "sem_t deve caber em uma cache line");
 struct alignas(heat2d::CACHELINE_BYTES) SemSlot {
@@ -384,22 +439,62 @@ struct ThreadHistory {
     const SideHistory& side(Side s) const noexcept { return s == Side::North ? north : south; }
 };
 
+
+static inline std::uint64_t sample_phase(int tid, Side side, std::uint64_t salt) noexcept {
+    std::uint64_t x = static_cast<std::uint64_t>(2 * tid + (side == Side::South ? 1 : 0)) + salt;
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+struct SampleGate {
+    int period = 0;
+    int countdown = 0;
+
+    void initialize(int p, std::uint64_t phase, bool force_first=false) noexcept {
+        period = std::max(0, p);
+        if (period <= 0) { countdown = 0; return; }
+        countdown = force_first ? 0 : static_cast<int>(phase % static_cast<std::uint64_t>(period));
+    }
+    bool hit() noexcept {
+        if (period <= 0) return false;
+        if (countdown > 0) { --countdown; return false; }
+        countdown = period - 1;
+        return true;
+    }
+};
+
+static inline double upper_clipped_sample(double x, double reference,
+                                          double factor) noexcept {
+    if (!(x >= 0.0) || !std::isfinite(x)) return reference;
+    if (reference > 0.0 && factor > 1.0)
+        x = std::min(x, factor * reference);
+    return x;
+}
+
 struct ProgressPenaltyModel {
     std::uint64_t samples = 0;
     std::uint64_t nonzero_samples = 0;
+    std::uint64_t bypass_events = 0;
     long double sum_ticks = 0.0L;
     double ewma_ticks = 0.0;
-    bool pending = false;
+    bool pending_sample = false;
+    SampleGate gate;
 
+    void initialize(int tid, Side side, int period) noexcept {
+        gate.initialize(period, sample_phase(tid, side, 0x123456789abcdef0ULL));
+    }
+    bool arm_sample() noexcept {
+        ++bypass_events;
+        return gate.hit();
+    }
     void observe(std::uint64_t ticks, double beta) noexcept {
         ++samples;
         if (ticks > 0) ++nonzero_samples;
         sum_ticks += static_cast<long double>(ticks);
         const double x = static_cast<double>(ticks);
         ewma_ticks = (samples == 1) ? x : ((1.0 - beta) * ewma_ticks + beta * x);
-    }
-    double mean_ticks() const noexcept {
-        return samples ? static_cast<double>(sum_ticks / static_cast<long double>(samples)) : 0.0;
     }
     double estimate_ticks(int bootstrap_samples) const noexcept {
         return samples >= static_cast<std::uint64_t>(bootstrap_samples) ? ewma_ticks : 0.0;
@@ -412,27 +507,34 @@ struct OnlineSideModel {
     double Cr_hat = 0.0;
     double Cw_hat = 0.0;
     double phi_hat = 1.0;
+
     std::uint64_t cr_samples = 0;
     std::uint64_t cw_samples = 0;
     std::uint64_t phi_samples = 0;
-    std::uint64_t phi_opportunities = 0;
-    int cached_global_min = 0;
+    std::uint64_t cr_events = 0;
+    std::uint64_t cw_events = 0;
+    std::uint64_t phi_events = 0;
+    SampleGate cr_gate, cw_gate, phi_gate;
 
-    void initialize(double cr0, double cw0) noexcept {
-        Cr0 = cr0;
-        Cw0 = cw0;
-        Cr_hat = cr0;
-        Cw_hat = cw0;
-        phi_hat = 1.0;
-        cached_global_min = 0;
+    void initialize(double cr0, double cw0, int tid, Side side,
+                    int cr_period, int cw_period, int phi_period) noexcept {
+        Cr0 = cr0; Cw0 = cw0;
+        Cr_hat = cr0; Cw_hat = cw0; phi_hat = 1.0;
+        cr_gate.initialize(cr_period, sample_phase(tid, side, 0x9e3779b97f4a7c15ULL));
+        cw_gate.initialize(cw_period, sample_phase(tid, side, 0xd1b54a32d192ed03ULL));
+        // phi precisa ser avaliado na primeira oportunidade antes de qualquer bypass.
+        phi_gate.initialize(phi_period, sample_phase(tid, side, 0x94d049bb133111ebULL), true);
     }
-    void observe_recompute(std::uint64_t ticks, double beta) noexcept {
-        const double x = static_cast<double>(ticks);
+    bool sample_recompute() noexcept { ++cr_events; return cr_gate.hit(); }
+    bool sample_wait() noexcept { ++cw_events; return cw_gate.hit(); }
+    bool refresh_phi() noexcept { ++phi_events; return phi_gate.hit(); }
+    void observe_recompute(std::uint64_t ticks, double beta, double clip_factor) noexcept {
+        const double x = upper_clipped_sample(static_cast<double>(ticks), Cr_hat, clip_factor);
         Cr_hat = (1.0 - beta) * Cr_hat + beta * x;
         ++cr_samples;
     }
-    void observe_wait(std::uint64_t ticks, double beta) noexcept {
-        const double x = static_cast<double>(ticks);
+    void observe_wait(std::uint64_t ticks, double beta, double clip_factor) noexcept {
+        const double x = upper_clipped_sample(static_cast<double>(ticks), Cw_hat, clip_factor);
         Cw_hat = (1.0 - beta) * Cw_hat + beta * x;
         ++cw_samples;
     }
@@ -442,32 +544,24 @@ struct OnlineSideModel {
         ++phi_samples;
         return phi_hat;
     }
-    double recompute_hat(int bootstrap) const noexcept {
-        return cr_samples >= static_cast<std::uint64_t>(bootstrap) ? Cr_hat : Cr0;
-    }
-    double wait_hat(int bootstrap) const noexcept {
-        return cw_samples >= static_cast<std::uint64_t>(bootstrap) ? Cw_hat : Cw0;
-    }
-    double contention_hat(int bootstrap) const noexcept {
-        return std::max(0.0, recompute_hat(bootstrap) - Cr0);
-    }
-    double recompute_immediate_hat(int bootstrap) const noexcept {
-        return Cr0 + contention_hat(bootstrap);
-    }
+    double recompute_hat() const noexcept { return Cr_hat; }
+    double wait_hat() const noexcept { return Cw_hat; }
+    double contention_proxy() const noexcept { return std::max(0.0, Cr_hat - Cr0); }
 };
 
 struct alignas(heat2d::CACHELINE_BYTES) ThreadStats {
     std::uint64_t read=0, recompute=0, predict=0, wait=0, lead_wait=0, predict_rejected=0;
     std::uint64_t recompute_blocked_progress=0;
+    std::uint64_t recompute_blocked_value=0;
     std::uint64_t recompute_blocked_v2=0;
     std::uint64_t v2_model_evaluations=0;
+    std::uint64_t v2_global_scans=0;
     long double v2_phi_sum=0.0L, v2_lhs_sum=0.0L, v2_rhs_sum=0.0L;
     double v2_phi_min=1.0, v2_phi_max=0.0;
     std::uint64_t v2_cr_observations=0, v2_cw_observations=0;
     std::uint64_t v2_cr_ticks_sum=0, v2_cw_ticks_sum=0;
     std::uint64_t progress_penalty_samples=0, progress_penalty_nonzero=0;
-    long double progress_penalty_ticks_sum=0.0L;
-    std::uint64_t lead_wait_ticks_sum=0;
+    std::uint64_t sampled_lead_wait_ticks_sum=0;
     double max_ratio_accepted=0.0, sum_ratio_accepted=0.0;
     std::uint64_t ratio_samples_accepted=0;
     double max_ratio_rejected=0.0, sum_ratio_rejected=0.0;
@@ -482,6 +576,8 @@ struct alignas(heat2d::CACHELINE_BYTES) ThreadStats {
     }
 };
 
+
+
 struct ThreadWorkspace {
     std::vector<double> north_halo, south_halo, Pnorth, Psouth, Dcombined, zero_line;
     ProgressPenaltyModel north_progress, south_progress;
@@ -492,9 +588,13 @@ struct ThreadWorkspace {
     OnlineSideModel& cost_model(Side side) noexcept {
         return side == Side::North ? north_cost : south_cost;
     }
-    void initialize_models(double Cr0, double Cw0) noexcept {
-        north_cost.initialize(Cr0, Cw0);
-        south_cost.initialize(Cr0, Cw0);
+    void initialize_models(double Cr0, double Cw0, int tid, const Config& cfg) noexcept {
+        north_cost.initialize(Cr0, Cw0, tid, Side::North,
+                              cfg.cr_sample_period, cfg.cw_sample_period, cfg.phi_sample_period);
+        south_cost.initialize(Cr0, Cw0, tid, Side::South,
+                              cfg.cr_sample_period, cfg.cw_sample_period, cfg.phi_sample_period);
+        north_progress.initialize(tid, Side::North, cfg.progress_sample_period);
+        south_progress.initialize(tid, Side::South, cfg.progress_sample_period);
     }
     void allocate(int N) {
         north_halo.assign(static_cast<std::size_t>(N), 0.0);
@@ -505,6 +605,7 @@ struct ThreadWorkspace {
         zero_line.assign(static_cast<std::size_t>(N), 0.0);
     }
 };
+
 
 static inline int boundary_gi(const Region& r, Side side) noexcept {
     return side == Side::North ? r.first : r.last;
@@ -722,26 +823,32 @@ static inline bool prediction_is_admissible(
     return ok;
 }
 
+
+static inline void publish_global_min(
+        const std::vector<ProgressSlot>& progress,
+        GlobalProgressSnapshot& snapshot, int nt) noexcept {
+    int gmin = progress[0].value.load(std::memory_order_acquire);
+    for (int t=1; t<nt; ++t)
+        gmin = std::min(gmin, progress[static_cast<std::size_t>(t)].value.load(std::memory_order_acquire));
+
+    // O minimo real so pode crescer. Uma epoca atrasada nunca reduz o snapshot.
+    int old = snapshot.min_level.load(std::memory_order_relaxed);
+    while (gmin > old &&
+           !snapshot.min_level.compare_exchange_weak(old, gmin,
+               std::memory_order_release, std::memory_order_relaxed)) {}
+}
+
 static inline double estimate_phi(
         const std::vector<ProgressSlot>& progress,
         const std::vector<BlockedSlot>& blocked_on,
+        const GlobalProgressSnapshot& global_progress,
         int tid, int nt, Side missing_side, int level,
         const Config& cfg, OnlineSideModel& model) noexcept {
     if (!cfg.enable_phi) return 1.0;
+    if (!model.refresh_phi()) return model.phi_hat;
 
-    ++model.phi_opportunities;
-    if (model.phi_opportunities == 1 ||
-        (model.phi_opportunities % static_cast<std::uint64_t>(cfg.phi_resample_period)) == 0) {
-        int gmin = progress[0].value.load(std::memory_order_acquire);
-        for (int t = 1; t < nt; ++t) {
-            gmin = std::min(gmin,
-                progress[static_cast<std::size_t>(t)].value.load(std::memory_order_acquire));
-        }
-        model.cached_global_min = gmin;
-    }
-
-    const int myp = progress[static_cast<std::size_t>(tid)].value.load(std::memory_order_acquire);
-    const int slack = std::max(0, myp - model.cached_global_min);
+    const int gmin = global_progress.min_level.load(std::memory_order_acquire);
+    const int slack = std::max(0, level - gmin);
     const double frontier = 1.0 / (1.0 + static_cast<double>(slack));
 
     const int other_nb = (missing_side == Side::North) ? tid + 1 : tid - 1;
@@ -756,8 +863,10 @@ static inline double estimate_phi(
         }
     }
 
-    return std::clamp(frontier * urgency, cfg.phi_floor, 1.0);
+    const double instant = std::clamp(frontier * urgency, cfg.phi_floor, 1.0);
+    return model.observe_phi(instant, cfg.phi_beta);
 }
+
 
 struct ResolveResult {
     Action action=Action::Boundary;
@@ -766,20 +875,26 @@ struct ResolveResult {
     std::uint64_t ratio_samples=0;
     bool predict_rejected=false;
     bool recompute_blocked_by_progress=false;
+    bool recompute_blocked_by_value=false;
     bool recompute_blocked_v2=false;
     bool model_evaluated=false;
     double phi_used=0.0, lhs_cost=0.0, rhs_value=0.0;
     double contention_hat=0.0, Cr_hat=0.0, Cw_hat=0.0;
+    bool recompute_sampled=false, wait_sampled=false;
     std::uint64_t recompute_observed_ticks=0;
     std::uint64_t wait_observed_ticks=0;
 };
 
+
 static inline ResolveResult resolve_halo(
         std::vector<ThreadHistory>& history, const std::vector<Region>& regions,
         const std::vector<ProgressSlot>& progress,
-        std::vector<BlockedSlot>& blocked_on, WaitBackend& wait_backend,
+        std::vector<BlockedSlot>& blocked_on,
+        const GlobalProgressSnapshot& global_progress,
+        WaitBackend& wait_backend,
         int tid, int nt, Side local_side, int level, int N, double mu,
         const Config& cfg, double progress_penalty_ticks, OnlineSideModel& cost_model,
+        std::uint64_t timer_overhead_ticks,
         double* scratch, std::vector<double>& Pbound,
         const double* zero_line) {
     ResolveResult r;
@@ -797,31 +912,24 @@ static inline ResolveResult resolve_halo(
     const bool rec_ok=cfg.enable_recompute && rv.valid();
 
     const double Cp = cfg.progress_lambda * progress_penalty_ticks;
-    const double phi_instant = estimate_phi(progress, blocked_on, tid, nt, local_side,
-                                            level, cfg, cost_model);
-    const double phi = cost_model.observe_phi(phi_instant, cfg.phi_beta);
-    const double Cr_immediate = cost_model.recompute_immediate_hat(cfg.online_bootstrap_samples);
-    const double Ccont = cost_model.contention_hat(cfg.online_bootstrap_samples);
-    const double Cr_online = cost_model.recompute_hat(cfg.online_bootstrap_samples);
-    const double Cw = cost_model.wait_hat(cfg.online_bootstrap_samples);
-    const double Cr_eff = Cr_immediate + Cp;
+    const double phi = estimate_phi(progress, blocked_on, global_progress, tid, nt,
+                                    local_side, level, cfg, cost_model);
+    const double Cr = cost_model.recompute_hat();
+    const double Cw = cost_model.wait_hat();
+    const double Cr_eff = Cr + Cp;
     const double wait_value = phi * Cw;
 
     r.model_evaluated = true;
     r.phi_used = phi;
     r.lhs_cost = Cr_eff;
     r.rhs_value = wait_value;
-    r.contention_hat = Ccont;
-    r.Cr_hat = Cr_online;
+    r.contention_hat = cost_model.contention_proxy();
+    r.Cr_hat = Cr;
     r.Cw_hat = Cw;
 
     const bool recompute_candidate = rec_ok && Cr_eff < wait_value;
     const double fallback = recompute_candidate ? Cr_eff : wait_value;
 
-    // Se PREDICT for aceito, ele tambem cria um bypass local e portanto
-    // carrega o mesmo custo de progresso esperado Cp. Nesta primeira versao,
-    // PREDICT nao e bloqueado pela porta de criticidade; sua admissibilidade
-    // numerica continua sendo o criterio primario.
     const double predict_expected_progress=cfg.accept_probability*Cp;
     const bool try_predict=cfg.enable_predict &&
         cfg.cost_predict_margin*cfg.try_predict_ticks + predict_expected_progress
@@ -839,38 +947,53 @@ static inline ResolveResult resolve_halo(
     }
 
     if (recompute_candidate) {
-        const std::uint64_t tr0 = progress_ticks_begin();
+        const bool sample = cost_model.sample_recompute();
+        const std::uint64_t tr0 = sample ? progress_ticks_begin() : 0;
         if (!recompute_remote_boundary(rv,N,mu,scratch)) std::abort();
-        const std::uint64_t rticks = progress_ticks_end() - tr0;
-        cost_model.observe_recompute(rticks, cfg.online_beta);
-        r.recompute_observed_ticks = rticks;
+        if (sample) {
+            const std::uint64_t raw = progress_ticks_end() - tr0;
+            const std::uint64_t ticks = subtract_timer_overhead(raw, timer_overhead_ticks);
+            cost_model.observe_recompute(ticks, cfg.online_beta, cfg.online_clip_factor);
+            r.recompute_sampled=true;
+            r.recompute_observed_ticks = ticks;
+        }
         r.action=Action::Recompute; r.halo=scratch; return r;
     }
     if (rec_ok) {
         r.recompute_blocked_v2=true;
-        if (Cr_immediate < Cw && Cr_eff >= wait_value) r.recompute_blocked_by_progress=true;
+        if (Cr >= wait_value) r.recompute_blocked_by_value=true;
+        else if (Cr_eff >= wait_value) r.recompute_blocked_by_progress=true;
     }
 
-    // Publica o estado de bloqueio antes da espera. A segunda leitura do
-    // progresso reduz a janela em que outro vizinho poderia observar um
-    // bloqueio que ja deixou de existir.
-    const std::uint64_t tw0 = progress_ticks_begin();
+    const bool sample_wait = cost_model.sample_wait();
     blocked_on[static_cast<std::size_t>(tid)].value.store(nb,std::memory_order_release);
+    bool did_wait=false;
+    std::uint64_t tw0=0;
     if (progress[static_cast<std::size_t>(nb)].value.load(std::memory_order_acquire)<level) {
-        wait_backend.wait_until_at_least(progress,tid,nb,level);
+        if (sample_wait) tw0=progress_ticks_begin();
+        did_wait=wait_backend.wait_until_at_least(progress,tid,nb,level);
     }
     blocked_on[static_cast<std::size_t>(tid)].value.store(-1,std::memory_order_release);
-    const std::uint64_t wticks = progress_ticks_end() - tw0;
-    cost_model.observe_wait(wticks, cfg.online_beta);
-    r.wait_observed_ticks = wticks;
+    if (sample_wait) {
+        std::uint64_t ticks=0;
+        if (did_wait) {
+            const std::uint64_t raw=progress_ticks_end()-tw0;
+            ticks=subtract_timer_overhead(raw,timer_overhead_ticks);
+        }
+        cost_model.observe_wait(ticks,cfg.online_beta,cfg.online_clip_factor);
+        r.wait_sampled=true;
+        r.wait_observed_ticks=ticks;
+    }
+
     const InterfaceSlot* exact=history[static_cast<std::size_t>(nb)].side(remote_side).get(level);
     if (!exact) {
         std::cerr << "Erro interno: snapshot nivel " << level << " do vizinho " << nb
-                  << " indisponivel apos WAIT.\n";
+                  << " indisponivel apos WAIT.\\n";
         std::abort();
     }
     r.action=Action::Wait; r.halo=exact->boundary.data(); return r;
 }
+
 
 static inline void update_region(const Region& r, const double* src, double* dst,
                                  std::size_t ld, int N, int TILE, double mu,
@@ -915,17 +1038,19 @@ static void print_config(const Config& c, double mu) {
               << "Adaptive V2 progress beta: " << c.progress_beta << '\n'
               << "Adaptive V2 phi beta: " << c.phi_beta << '\n'
               << "Adaptive V2 phi floor: " << c.phi_floor << '\n'
-              << "Adaptive V2 phi resample period: " << c.phi_resample_period << '\n'
-              << "Adaptive V2 online bootstrap samples: " << c.online_bootstrap_samples << '\n'
+              << "Adaptive V2 online clip factor: " << c.online_clip_factor << '\n'
+              << "Adaptive V2 CR sample period: " << c.cr_sample_period << '\n'
+              << "Adaptive V2 CW sample period: " << c.cw_sample_period << '\n'
+              << "Adaptive V2 progress sample period: " << c.progress_sample_period << '\n'
+              << "Adaptive V2 phi sample period: " << c.phi_sample_period << '\n'
+              << "Adaptive V2 phi global refresh steps: " << c.phi_global_refresh_steps << '\n'
+              << "Adaptive V2 timer calibration samples: " << c.timer_calibration_samples << '\n'
               << "Adaptive P/R cost file: " << c.pr_cost_file << '\n'
               << "Adaptive WAIT cost file: " << c.wait_cost_file << '\n'
               << "Adaptive try-PREDICT: " << c.try_predict_ticks << ' ' << c.tick_unit << '\n'
-              << "Adaptive RECOMPUTE: " << c.recompute_ticks << ' ' << c.tick_unit << '\n'
+              << "Adaptive RECOMPUTE initial: " << c.recompute_ticks << ' ' << c.tick_unit << '\n'
               << "Adaptive PREDICT acceptance: " << c.accept_probability << '\n'
-              << "Adaptive WAIT: " << c.wait_ticks << ' ' << c.tick_unit << '\n'
-              << "Adaptive direct R/W choice: " << (c.recompute_ticks < c.wait_ticks ? "RECOMPUTE" : "WAIT") << '\n'
-              << "Adaptive try-PREDICT threshold RHS: "
-              << c.accept_probability*std::min(c.recompute_ticks,c.wait_ticks) << ' ' << c.tick_unit << '\n'
+              << "Adaptive WAIT initial: " << c.wait_ticks << ' ' << c.tick_unit << '\n'
               << "Adaptive profiling statistics: " << (PROFILE_STATS_ENABLED?"enabled":"disabled") << '\n'
               << "mu: " << mu << '\n';
 }
@@ -994,6 +1119,7 @@ int main() {
     std::vector<ThreadHistory> history(static_cast<std::size_t>(ntmax));
     std::vector<ThreadWorkspace> workspace(static_cast<std::size_t>(ntmax));
     std::vector<ThreadStats> stats(static_cast<std::size_t>(ntmax));
+    GlobalProgressSnapshot global_progress;
 
     #pragma omp parallel for schedule(static)
     for (int t=0;t<ntmax;++t) {
@@ -1001,7 +1127,7 @@ int main() {
         blocked_on[static_cast<std::size_t>(t)].value.store(-1,std::memory_order_relaxed);
         history[static_cast<std::size_t>(t)].allocate(N);
         workspace[static_cast<std::size_t>(t)].allocate(N);
-        workspace[static_cast<std::size_t>(t)].initialize_models(cfg.recompute_ticks, cfg.wait_ticks);
+        workspace[static_cast<std::size_t>(t)].initialize_models(cfg.recompute_ticks, cfg.wait_ticks, t, cfg);
     }
 
     #pragma omp parallel for schedule(static)
@@ -1011,6 +1137,10 @@ int main() {
     }
 
     WaitBackend wait_backend(ntmax);
+    const std::uint64_t timer_overhead_ticks =
+        calibrate_timer_overhead(cfg.timer_calibration_samples);
+    std::cout << "Adaptive V2 timer overhead: " << timer_overhead_ticks
+              << ' ' << cfg.tick_unit << '\n';
     const auto t0=std::chrono::high_resolution_clock::now();
 
     #pragma omp parallel default(shared)
@@ -1019,34 +1149,49 @@ int main() {
         const Region& rg=regions[static_cast<std::size_t>(tid)];
         ThreadWorkspace& ws=workspace[static_cast<std::size_t>(tid)];
         ThreadStats& st=stats[static_cast<std::size_t>(tid)];
+        int next_global_refresh_step = 0;
+        int global_refresh_leader = 0;
 
         for (int step=0;step<T;++step) {
+            if (cfg.enable_phi && step == next_global_refresh_step) {
+                if (tid == global_refresh_leader) {
+                    publish_global_min(progress, global_progress, nt);
+                    if constexpr (PROFILE_STATS_ENABLED) ++st.v2_global_scans;
+                }
+                next_global_refresh_step += cfg.phi_global_refresh_steps;
+                ++global_refresh_leader;
+                if (global_refresh_leader == nt) global_refresh_leader = 0;
+            }
             const int min_level=step+1-cfg.max_lead;
 
             auto settle_lead_guard=[&](Side side, int nb) {
                 ProgressPenaltyModel& pm=ws.progress_model(side);
-                const bool need_ticks=pm.pending || PROFILE_STATS_ENABLED;
-                const std::uint64_t tguard0=need_ticks?progress_ticks_begin():0;
                 bool w=false;
+                std::uint64_t sampled_ticks=0;
                 if (progress[static_cast<std::size_t>(nb)].value.load(std::memory_order_acquire)<min_level) {
                     blocked_on[static_cast<std::size_t>(tid)].value.store(nb,std::memory_order_release);
-                    if (progress[static_cast<std::size_t>(nb)].value.load(std::memory_order_acquire)<min_level)
+                    if (progress[static_cast<std::size_t>(nb)].value.load(std::memory_order_acquire)<min_level) {
+                        const std::uint64_t tguard0=pm.pending_sample?progress_ticks_begin():0;
                         w=wait_backend.wait_until_at_least(progress,tid,nb,min_level);
+                        if (pm.pending_sample && w) {
+                            const std::uint64_t raw=progress_ticks_end()-tguard0;
+                            sampled_ticks=subtract_timer_overhead(raw,timer_overhead_ticks);
+                        }
+                    }
                     blocked_on[static_cast<std::size_t>(tid)].value.store(-1,std::memory_order_release);
                 }
-                const std::uint64_t ticks=(need_ticks && w)?(progress_ticks_end()-tguard0):0;
 
-                if (pm.pending) {
-                    pm.observe(ticks, cfg.progress_beta);
+                if (pm.pending_sample) {
+                    pm.observe(sampled_ticks, cfg.progress_beta);
                     if constexpr (PROFILE_STATS_ENABLED) {
                         ++st.progress_penalty_samples;
-                        if (ticks>0) ++st.progress_penalty_nonzero;
-                        st.progress_penalty_ticks_sum += static_cast<long double>(ticks);
+                        if (sampled_ticks>0) ++st.progress_penalty_nonzero;
+                        st.sampled_lead_wait_ticks_sum += sampled_ticks;
                     }
-                    pm.pending=false;
+                    pm.pending_sample=false;
                 }
                 if constexpr (PROFILE_STATS_ENABLED) {
-                    if (w) { ++st.lead_wait; st.lead_wait_ticks_sum += ticks; }
+                    if (w) ++st.lead_wait;
                 }
             };
 
@@ -1058,14 +1203,18 @@ int main() {
 
             const double north_penalty=ws.north_progress.estimate_ticks(cfg.progress_bootstrap_samples);
             const double south_penalty=ws.south_progress.estimate_ticks(cfg.progress_bootstrap_samples);
-            ResolveResult rn=resolve_halo(history,regions,progress,blocked_on,wait_backend,tid,nt,Side::North,
-                step,N,mu,cfg,north_penalty,ws.north_cost,ws.north_halo.data(),ws.Pnorth,ws.zero_line.data());
-            ResolveResult rs=resolve_halo(history,regions,progress,blocked_on,wait_backend,tid,nt,Side::South,
-                step,N,mu,cfg,south_penalty,ws.south_cost,ws.south_halo.data(),ws.Psouth,ws.zero_line.data());
+            ResolveResult rn=resolve_halo(history,regions,progress,blocked_on,global_progress,wait_backend,tid,nt,Side::North,
+                step,N,mu,cfg,north_penalty,ws.north_cost,timer_overhead_ticks,
+                ws.north_halo.data(),ws.Pnorth,ws.zero_line.data());
+            ResolveResult rs=resolve_halo(history,regions,progress,blocked_on,global_progress,wait_backend,tid,nt,Side::South,
+                step,N,mu,cfg,south_penalty,ws.south_cost,timer_overhead_ticks,
+                ws.south_halo.data(),ws.Psouth,ws.zero_line.data());
 
-            // Um bypass local pode reaparecer como lead-guard no proximo passo.
-            if (rn.action==Action::Recompute || rn.action==Action::Predict) ws.north_progress.pending=true;
-            if (rs.action==Action::Recompute || rs.action==Action::Predict) ws.south_progress.pending=true;
+            // Somente uma fracao dos bypasses arma medicao do lead-guard seguinte.
+            if (rn.action==Action::Recompute || rn.action==Action::Predict)
+                ws.north_progress.pending_sample = ws.north_progress.arm_sample();
+            if (rs.action==Action::Recompute || rs.action==Action::Predict)
+                ws.south_progress.pending_sample = ws.south_progress.arm_sample();
 
             if constexpr (PROFILE_STATS_ENABLED) {
                 st.count(rn.action); st.count(rs.action);
@@ -1073,6 +1222,8 @@ int main() {
                 if (rs.predict_rejected) ++st.predict_rejected;
                 if (rn.recompute_blocked_by_progress) ++st.recompute_blocked_progress;
                 if (rs.recompute_blocked_by_progress) ++st.recompute_blocked_progress;
+                if (rn.recompute_blocked_by_value) ++st.recompute_blocked_value;
+                if (rs.recompute_blocked_by_value) ++st.recompute_blocked_value;
                 if (rn.recompute_blocked_v2) ++st.recompute_blocked_v2;
                 if (rs.recompute_blocked_v2) ++st.recompute_blocked_v2;
                 auto acc_v2=[&](const ResolveResult& x) {
@@ -1083,8 +1234,8 @@ int main() {
                     st.v2_rhs_sum += x.rhs_value;
                     st.v2_phi_min = std::min(st.v2_phi_min, x.phi_used);
                     st.v2_phi_max = std::max(st.v2_phi_max, x.phi_used);
-                    if (x.recompute_observed_ticks) { ++st.v2_cr_observations; st.v2_cr_ticks_sum += x.recompute_observed_ticks; }
-                    if (x.wait_observed_ticks) { ++st.v2_cw_observations; st.v2_cw_ticks_sum += x.wait_observed_ticks; }
+                    if (x.recompute_sampled) { ++st.v2_cr_observations; st.v2_cr_ticks_sum += x.recompute_observed_ticks; }
+                    if (x.wait_sampled) { ++st.v2_cw_observations; st.v2_cw_ticks_sum += x.wait_observed_ticks; }
                 };
                 acc_v2(rn); acc_v2(rs);
                 auto acc=[&](const ResolveResult& x) {
@@ -1127,16 +1278,16 @@ int main() {
 
     if constexpr (PROFILE_STATS_ENABLED) {
         std::uint64_t rd=0,rc=0,pr=0,wt=0,lw=0,rj=0,sa=0,sr=0;
-        std::uint64_t blocked_progress=0, blocked_v2=0, v2_evals=0, v2_cr_obs=0, v2_cw_obs=0;
+        std::uint64_t blocked_progress=0, blocked_value=0, blocked_v2=0, v2_evals=0, v2_cr_obs=0, v2_cw_obs=0;
         std::uint64_t v2_cr_ticks=0, v2_cw_ticks=0;
         long double v2_phi_sum=0.0L, v2_lhs_sum=0.0L, v2_rhs_sum=0.0L;
         double v2_phi_min=1.0, v2_phi_max=0.0;
-        std::uint64_t penalty_samples=0, penalty_nonzero=0, lead_wait_ticks=0;
-        long double penalty_ticks_sum=0.0L;
+        std::uint64_t penalty_samples=0, penalty_nonzero=0, sampled_lead_wait_ticks=0, global_scans=0;
         double ma=0.0,mr=0.0,xa=0.0,xr=0.0;
         for (const ThreadStats& s:stats) {
             rd+=s.read; rc+=s.recompute; pr+=s.predict; wt+=s.wait; lw+=s.lead_wait; rj+=s.predict_rejected;
             blocked_progress+=s.recompute_blocked_progress;
+            blocked_value+=s.recompute_blocked_value;
             blocked_v2+=s.recompute_blocked_v2;
             v2_evals+=s.v2_model_evaluations;
             v2_phi_sum+=s.v2_phi_sum; v2_lhs_sum+=s.v2_lhs_sum; v2_rhs_sum+=s.v2_rhs_sum;
@@ -1147,18 +1298,35 @@ int main() {
             v2_cr_obs+=s.v2_cr_observations; v2_cw_obs+=s.v2_cw_observations;
             v2_cr_ticks+=s.v2_cr_ticks_sum; v2_cw_ticks+=s.v2_cw_ticks_sum;
             penalty_samples+=s.progress_penalty_samples; penalty_nonzero+=s.progress_penalty_nonzero;
-            penalty_ticks_sum+=s.progress_penalty_ticks_sum; lead_wait_ticks+=s.lead_wait_ticks_sum;
+            sampled_lead_wait_ticks+=s.sampled_lead_wait_ticks_sum; global_scans+=s.v2_global_scans;
             sa+=s.ratio_samples_accepted; sr+=s.ratio_samples_rejected;
             ma=std::max(ma,s.max_ratio_accepted); mr=std::max(mr,s.max_ratio_rejected);
             xa+=s.sum_ratio_accepted; xr+=s.sum_ratio_rejected;
         }
+        long double final_cr_sum=0.0L, final_cw_sum=0.0L, final_phi_sum=0.0L, final_cont_sum=0.0L;
+        std::uint64_t model_cr_samples=0, model_cw_samples=0, model_phi_updates=0;
+        for (const ThreadWorkspace& w : workspace) {
+            const OnlineSideModel* models[2] = {&w.north_cost, &w.south_cost};
+            for (const OnlineSideModel* m : models) {
+                final_cr_sum += m->Cr_hat;
+                final_cw_sum += m->Cw_hat;
+                final_phi_sum += m->phi_hat;
+                final_cont_sum += m->contention_proxy();
+                model_cr_samples += m->cr_samples;
+                model_cw_samples += m->cw_samples;
+                model_phi_updates += m->phi_samples;
+            }
+        }
+        const double model_sides = static_cast<double>(2 * ntmax);
         std::cout << "Adaptive actions READ: " << rd << '\n'
                   << "Adaptive actions RECOMPUTE: " << rc << '\n'
                   << "Adaptive actions PREDICT: " << pr << '\n'
                   << "Adaptive actions WAIT: " << wt << '\n'
                   << "Adaptive lead-guard waits: " << lw << '\n'
-                  << "Lead-guard wait ticks sum: " << lead_wait_ticks << '\n'
+                  << "V2 sampled lead-guard wait ticks sum: " << sampled_lead_wait_ticks << '\n'
+                  << "V2 global progress scans: " << global_scans << '\n'
                   << "Progress-blocked RECOMPUTE: " << blocked_progress << '\n'
+                  << "V2 immediate-value blocked RECOMPUTE: " << blocked_value << '\n'
                   << "V2 RECOMPUTE rejected by model: " << blocked_v2 << '\n'
                   << "V2 model evaluations: " << v2_evals << '\n'
                   << std::setprecision(16)
@@ -1171,11 +1339,18 @@ int main() {
                   << "V2 observed RECOMPUTE mean: " << (v2_cr_obs?static_cast<double>(v2_cr_ticks)/static_cast<double>(v2_cr_obs):0.0) << ' ' << cfg.tick_unit << '\n'
                   << "V2 observed WAIT samples: " << v2_cw_obs << '\n'
                   << "V2 observed WAIT mean: " << (v2_cw_obs?static_cast<double>(v2_cw_ticks)/static_cast<double>(v2_cw_obs):0.0) << ' ' << cfg.tick_unit << '\n'
+                  << "V2 final CR hat mean: " << static_cast<double>(final_cr_sum/model_sides) << ' ' << cfg.tick_unit << '\n'
+                  << "V2 final CW hat mean: " << static_cast<double>(final_cw_sum/model_sides) << ' ' << cfg.tick_unit << '\n'
+                  << "V2 final contention proxy mean: " << static_cast<double>(final_cont_sum/model_sides) << ' ' << cfg.tick_unit << '\n'
+                  << "V2 final phi hat mean: " << static_cast<double>(final_phi_sum/model_sides) << '\n'
+                  << "V2 model CR samples: " << model_cr_samples << '\n'
+                  << "V2 model CW samples: " << model_cw_samples << '\n'
+                  << "V2 model phi updates: " << model_phi_updates << '\n'
                   << "Progress penalty samples: " << penalty_samples << '\n'
                   << "Progress penalty nonzero samples: " << penalty_nonzero << '\n'
                   << std::setprecision(16)
                   << "Progress penalty observed mean: "
-                  << (penalty_samples?static_cast<double>(penalty_ticks_sum/static_cast<long double>(penalty_samples)):0.0)
+                  << (penalty_samples?static_cast<double>(sampled_lead_wait_ticks)/static_cast<double>(penalty_samples):0.0)
                   << ' ' << cfg.tick_unit << '\n'
                   << "Progress penalty nonzero fraction: "
                   << (penalty_samples?static_cast<double>(penalty_nonzero)/static_cast<double>(penalty_samples):0.0) << '\n'
