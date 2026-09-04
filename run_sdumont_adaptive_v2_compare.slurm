@@ -18,7 +18,7 @@ set -euo pipefail
 #   BASE     = native no-false-sharing solver
 #   WAIT     = current adaptive infrastructure with RECOMPUTE disabled
 #   CRITICAL = current progress+binary-criticality controller
-#   V2       = sparse-online C_R/C_W + sampled progress penalty + continuous phi
+#   V2       = conservative progress bootstrap + sparse-online C_R/C_W + continuous phi
 #
 # Default matrix:
 #   p       = 64 160
@@ -47,7 +47,8 @@ WAIT_CAL_SAMPLES="${WAIT_CAL_SAMPLES:-32}"
 
 PROGRESS_LAMBDA="${PROGRESS_LAMBDA:-1.0}"
 CURRENT_PROGRESS_BOOTSTRAP="${CURRENT_PROGRESS_BOOTSTRAP:-8}"
-V2_PROGRESS_BOOTSTRAP="${V2_PROGRESS_BOOTSTRAP:-4}"
+V2_PROGRESS_BOOTSTRAP="${V2_PROGRESS_BOOTSTRAP:-8}"
+V2_EXPLORE_PERIOD="${V2_EXPLORE_PERIOD:-16}"
 
 # Sparse online adaptation: defaults chosen to keep measurement overhead small.
 V2_ONLINE_BETA="${V2_ONLINE_BETA:-0.20}"
@@ -197,7 +198,8 @@ run_v2() {
         HEAT2D_COST_FILE="${cost}" \
         HEAT2D_WAIT_COST_FILE="${waitcost}" \
         HEAT2D_PROGRESS_LAMBDA="${PROGRESS_LAMBDA}" \
-        HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES="${V2_PROGRESS_BOOTSTRAP}" \
+        HEAT2D_V2_PROGRESS_BOOTSTRAP="${V2_PROGRESS_BOOTSTRAP}" \
+        HEAT2D_V2_EXPLORE_PERIOD="${V2_EXPLORE_PERIOD}" \
         HEAT2D_ONLINE_BETA="${V2_ONLINE_BETA}" \
         HEAT2D_PROGRESS_BETA="${V2_PROGRESS_BETA}" \
         HEAT2D_PHI_BETA="${V2_PHI_BETA}" \
@@ -214,6 +216,12 @@ run_v2() {
     check_common_log "${log}" "${threads}"
     grep -q '^Adaptive predict: off$' "${log}" || { echo "ERRO: V2 PREDICT deveria estar off em ${log}" >&2; exit 6; }
     grep -q '^Adaptive V2 phi-aware: on$' "${log}" || { echo "ERRO: phi deveria estar on em ${log}" >&2; exit 6; }
+    grep -q "^Adaptive V2 progress bootstrap samples: ${V2_PROGRESS_BOOTSTRAP}$" "${log}" || {
+        echo "ERRO: bootstrap V2 inesperado em ${log}" >&2; exit 6;
+    }
+    grep -q "^Adaptive V2 explore period: ${V2_EXPLORE_PERIOD}$" "${log}" || {
+        echo "ERRO: explore period V2 inesperado em ${log}" >&2; exit 6;
+    }
 }
 
 run_policy() {
@@ -411,6 +419,8 @@ for pdir in sorted(glob.glob(os.path.join(outdir,'threads_*'))):
                     'critical_recompute':read_scalar(lines,'Critical RECOMPUTE'),
                     'noncritical_recompute_rejected':read_scalar(lines,'Noncritical RECOMPUTE rejected'),
                     'v2_recompute_rejected':read_scalar(lines,'V2 RECOMPUTE rejected by model'),
+                    'v2_exploratory_recomputes':read_scalar(lines,'V2 exploratory RECOMPUTE'),
+                    'v2_bootstrap_wait_decisions':read_scalar(lines,'V2 bootstrap WAIT decisions'),
                     'v2_model_evaluations':read_scalar(lines,'V2 model evaluations'),
                     'v2_phi_mean':read_scalar(lines,'V2 phi mean'),
                     'v2_phi_min':read_scalar(lines,'V2 phi min'),
@@ -428,6 +438,8 @@ for pdir in sorted(glob.glob(os.path.join(outdir,'threads_*'))):
                     'v2_model_cr_samples':read_scalar(lines,'V2 model CR samples'),
                     'v2_model_cw_samples':read_scalar(lines,'V2 model CW samples'),
                     'v2_model_phi_updates':read_scalar(lines,'V2 model phi updates'),
+                    'v2_progress_bootstrap_ready_sides':read_scalar(lines,'V2 progress bootstrap ready sides'),
+                    'v2_progress_bootstrap_total_sides':read_scalar(lines,'V2 progress bootstrap total sides'),
                     'v2_timer_overhead_ticks':read_scalar(lines,'Adaptive V2 timer overhead'),
                     'penalty_samples':read_scalar(lines,'Progress penalty samples'),
                     'penalty_nonzero_samples':read_scalar(lines,'Progress penalty nonzero samples'),
@@ -487,6 +499,7 @@ PY
     echo "PROGRESS_LAMBDA=${PROGRESS_LAMBDA}"
     echo "CURRENT_PROGRESS_BOOTSTRAP=${CURRENT_PROGRESS_BOOTSTRAP}"
     echo "V2_PROGRESS_BOOTSTRAP=${V2_PROGRESS_BOOTSTRAP}"
+    echo "V2_EXPLORE_PERIOD=${V2_EXPLORE_PERIOD}"
     echo "V2_ONLINE_BETA=${V2_ONLINE_BETA}"
     echo "V2_PROGRESS_BETA=${V2_PROGRESS_BETA}"
     echo "V2_PHI_BETA=${V2_PHI_BETA}"

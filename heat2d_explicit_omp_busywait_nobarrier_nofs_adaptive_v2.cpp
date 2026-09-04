@@ -22,6 +22,16 @@
 //     rotacionada entre epocas, atualiza ocasionalmente um minimo global de
 //     progresso; as demais reutilizam esse snapshot sem barreira.
 //
+// Cold start de C_progress:
+//   - enquanto um lado ainda nao acumulou amostras suficientes de C_progress,
+//     WAIT e a acao padrao;
+//   - somente 1 em HEAT2D_V2_EXPLORE_PERIOD oportunidades elegiveis executa
+//     um RECOMPUTE exploratorio;
+//   - todo RECOMPUTE exploratorio arma obrigatoriamente uma amostra do
+//     lead-guard seguinte;
+//   - apos HEAT2D_V2_PROGRESS_BOOTSTRAP amostras, a politica completa entra
+//     em operacao naquele lado.
+//
 // A estimativa continua phi in [0,1] combina:
 //   (a) proximidade da thread ao fronte global de progresso; e
 //   (b) urgencia do outro vizinho que pode depender dela.
@@ -134,7 +144,8 @@ struct Config {
     bool enable_recompute = true;
     int max_lead = 2;
     double progress_lambda = 1.0;
-    int progress_bootstrap_samples = 4;
+    int progress_bootstrap_samples = 8;
+    int explore_period = 16;
 
     // Adaptive-V2 sparse online model.
     bool enable_phi = true;
@@ -185,7 +196,11 @@ struct Config {
         c.enable_recompute = getenv_int("HEAT2D_ENABLE_RECOMPUTE", 1) != 0;
         c.max_lead = getenv_int("HEAT2D_MAX_LEAD", 2);
         c.progress_lambda = getenv_double("HEAT2D_PROGRESS_LAMBDA", c.progress_lambda);
-        c.progress_bootstrap_samples = getenv_int("HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES", c.progress_bootstrap_samples);
+        // Novo nome V2; o nome antigo permanece como fallback para compatibilidade.
+        c.progress_bootstrap_samples = getenv_int(
+            "HEAT2D_V2_PROGRESS_BOOTSTRAP",
+            getenv_int("HEAT2D_PROGRESS_BOOTSTRAP_SAMPLES", c.progress_bootstrap_samples));
+        c.explore_period = getenv_int("HEAT2D_V2_EXPLORE_PERIOD", c.explore_period);
 
         c.enable_phi = getenv_int("HEAT2D_ENABLE_PHI", 1) != 0;
         c.online_beta = getenv_double("HEAT2D_ONLINE_BETA", c.online_beta);
@@ -206,6 +221,7 @@ struct Config {
         if (!(c.cost_predict_margin > 0.0)) c.cost_predict_margin = 1.0;
         if (!(c.progress_lambda >= 0.0) || !std::isfinite(c.progress_lambda)) c.progress_lambda = 1.0;
         if (c.progress_bootstrap_samples < 1) c.progress_bootstrap_samples = 1;
+        if (c.explore_period < 1) c.explore_period = 1;
         if (!(c.online_beta > 0.0 && c.online_beta <= 1.0)) c.online_beta = 0.20;
         if (!(c.progress_beta > 0.0 && c.progress_beta <= 1.0)) c.progress_beta = 0.20;
         if (!(c.phi_beta > 0.0 && c.phi_beta <= 1.0)) c.phi_beta = 0.25;
@@ -457,13 +473,29 @@ struct ProgressPenaltyModel {
     std::uint64_t samples = 0;
     std::uint64_t nonzero_samples = 0;
     std::uint64_t bypass_events = 0;
+    std::uint64_t bootstrap_opportunities = 0;
+    std::uint64_t exploratory_recomputes = 0;
     long double sum_ticks = 0.0L;
     double ewma_ticks = 0.0;
     bool pending_sample = false;
     SampleGate gate;
+    SampleGate explore_gate;
 
-    void initialize(int tid, Side side, int period) noexcept {
+    void initialize(int tid, Side side, int period, int explore_period) noexcept {
         gate.initialize(period, sample_phase(tid, side, 0x123456789abcdef0ULL));
+        // Fases diferentes entre threads/lados evitam uma onda de exploracao sincronizada.
+        explore_gate.initialize(explore_period,
+                                sample_phase(tid, side, 0xa0761d6478bd642fULL));
+    }
+    bool ready(int bootstrap_samples) const noexcept {
+        return samples >= static_cast<std::uint64_t>(bootstrap_samples);
+    }
+    bool should_explore(int bootstrap_samples) noexcept {
+        if (ready(bootstrap_samples)) return false;
+        ++bootstrap_opportunities;
+        if (!explore_gate.hit()) return false;
+        ++exploratory_recomputes;
+        return true;
     }
     bool arm_sample() noexcept {
         ++bypass_events;
@@ -477,7 +509,7 @@ struct ProgressPenaltyModel {
         ewma_ticks = (samples == 1) ? x : ((1.0 - beta) * ewma_ticks + beta * x);
     }
     double estimate_ticks(int bootstrap_samples) const noexcept {
-        return samples >= static_cast<std::uint64_t>(bootstrap_samples) ? ewma_ticks : 0.0;
+        return ready(bootstrap_samples) ? ewma_ticks : 0.0;
     }
 };
 
@@ -534,6 +566,8 @@ struct alignas(heat2d::CACHELINE_BYTES) ThreadStats {
     std::uint64_t recompute_blocked_progress=0;
     std::uint64_t recompute_blocked_value=0;
     std::uint64_t recompute_blocked_v2=0;
+    std::uint64_t v2_exploratory_recomputes=0;
+    std::uint64_t v2_bootstrap_wait_decisions=0;
     std::uint64_t v2_model_evaluations=0;
     std::uint64_t v2_global_scans=0;
     long double v2_phi_sum=0.0L, v2_lhs_sum=0.0L, v2_rhs_sum=0.0L;
@@ -573,8 +607,8 @@ struct ThreadWorkspace {
                               cfg.cr_sample_period, cfg.cw_sample_period, cfg.phi_sample_period);
         south_cost.initialize(Cr0, Cw0, tid, Side::South,
                               cfg.cr_sample_period, cfg.cw_sample_period, cfg.phi_sample_period);
-        north_progress.initialize(tid, Side::North, cfg.progress_sample_period);
-        south_progress.initialize(tid, Side::South, cfg.progress_sample_period);
+        north_progress.initialize(tid, Side::North, cfg.progress_sample_period, cfg.explore_period);
+        south_progress.initialize(tid, Side::South, cfg.progress_sample_period, cfg.explore_period);
     }
     void allocate(int N) {
         north_halo.assign(static_cast<std::size_t>(N), 0.0);
@@ -861,6 +895,8 @@ struct ResolveResult {
     double phi_used=0.0, lhs_cost=0.0, rhs_value=0.0;
     double contention_hat=0.0, Cr_hat=0.0, Cw_hat=0.0;
     bool recompute_sampled=false, wait_sampled=false;
+    bool v2_exploratory_recompute=false;
+    bool v2_bootstrap_wait=false;
     std::uint64_t recompute_observed_ticks=0;
     std::uint64_t wait_observed_ticks=0;
 };
@@ -873,7 +909,8 @@ static inline ResolveResult resolve_halo(
         const GlobalProgressSnapshot& global_progress,
         WaitBackend& wait_backend,
         int tid, int nt, Side local_side, int level, int N, double mu,
-        const Config& cfg, double progress_penalty_ticks, OnlineSideModel& cost_model,
+        const Config& cfg, double progress_penalty_ticks, ProgressPenaltyModel& progress_model,
+        OnlineSideModel& cost_model,
         std::uint64_t timer_overhead_ticks,
         double* scratch, std::vector<double>& Pbound,
         const double* zero_line) {
@@ -891,42 +928,7 @@ static inline ResolveResult resolve_halo(
         : RecomputeView{};
     const bool rec_ok=cfg.enable_recompute && rv.valid();
 
-    const double Cp = cfg.progress_lambda * progress_penalty_ticks;
-    const double phi = estimate_phi(progress, blocked_on, global_progress, tid, nt,
-                                    local_side, level, cfg, cost_model);
-    const double Cr = cost_model.recompute_hat();
-    const double Cw = cost_model.wait_hat();
-    const double Cr_eff = Cr + Cp;
-    const double wait_value = phi * Cw;
-
-    r.model_evaluated = true;
-    r.phi_used = phi;
-    r.lhs_cost = Cr_eff;
-    r.rhs_value = wait_value;
-    r.contention_hat = cost_model.contention_proxy();
-    r.Cr_hat = Cr;
-    r.Cw_hat = Cw;
-
-    const bool recompute_candidate = rec_ok && Cr_eff < wait_value;
-    const double fallback = recompute_candidate ? Cr_eff : wait_value;
-
-    const double predict_expected_progress=cfg.accept_probability*Cp;
-    const bool try_predict=cfg.enable_predict &&
-        cfg.cost_predict_margin*cfg.try_predict_ticks + predict_expected_progress
-            < cfg.accept_probability*fallback;
-
-    if (try_predict) {
-        bool evaluated=false;
-        const bool pred_ok=prediction_is_admissible(
-            history,regions,tid,nb,local_side,level,N,mu,cfg,Pbound,scratch,
-            r.max_ratio,r.sum_ratio,r.ratio_samples,evaluated);
-        if constexpr (PROFILE_STATS_ENABLED) {
-            if (evaluated && !pred_ok) r.predict_rejected=true;
-        }
-        if (pred_ok) { r.action=Action::Predict; r.halo=scratch; return r; }
-    }
-
-    if (recompute_candidate) {
+    auto execute_recompute = [&](bool exploratory) -> ResolveResult {
         const bool sample = cost_model.sample_recompute();
         const std::uint64_t tr0 = sample ? progress_ticks_begin() : 0;
         if (!recompute_remote_boundary(rv,N,mu,scratch)) std::abort();
@@ -937,12 +939,63 @@ static inline ResolveResult resolve_halo(
             r.recompute_sampled=true;
             r.recompute_observed_ticks = ticks;
         }
-        r.action=Action::Recompute; r.halo=scratch; return r;
-    }
-    if (rec_ok) {
-        r.recompute_blocked_v2=true;
-        if (Cr >= wait_value) r.recompute_blocked_by_value=true;
-        else if (Cr_eff >= wait_value) r.recompute_blocked_by_progress=true;
+        r.v2_exploratory_recompute = exploratory;
+        r.action=Action::Recompute;
+        r.halo=scratch;
+        return r;
+    };
+
+    // Cold start conservador de C_progress. Enquanto nao ha amostras suficientes,
+    // WAIT e a regra; recomputamos apenas esparsamente para aprender a divida futura.
+    const bool progress_ready = progress_model.ready(cfg.progress_bootstrap_samples);
+    if (!progress_ready) {
+        if (rec_ok && progress_model.should_explore(cfg.progress_bootstrap_samples))
+            return execute_recompute(true);
+        if (rec_ok) r.v2_bootstrap_wait=true;
+    } else {
+        const double Cp = cfg.progress_lambda * progress_penalty_ticks;
+        const double phi = estimate_phi(progress, blocked_on, global_progress, tid, nt,
+                                        local_side, level, cfg, cost_model);
+        const double Cr = cost_model.recompute_hat();
+        const double Cw = cost_model.wait_hat();
+        const double Cr_eff = Cr + Cp;
+        const double wait_value = phi * Cw;
+
+        r.model_evaluated = true;
+        r.phi_used = phi;
+        r.lhs_cost = Cr_eff;
+        r.rhs_value = wait_value;
+        r.contention_hat = cost_model.contention_proxy();
+        r.Cr_hat = Cr;
+        r.Cw_hat = Cw;
+
+        const bool recompute_candidate = rec_ok && Cr_eff < wait_value;
+        const double fallback = recompute_candidate ? Cr_eff : wait_value;
+
+        const double predict_expected_progress=cfg.accept_probability*Cp;
+        const bool try_predict=cfg.enable_predict &&
+            cfg.cost_predict_margin*cfg.try_predict_ticks + predict_expected_progress
+                < cfg.accept_probability*fallback;
+
+        if (try_predict) {
+            bool evaluated=false;
+            const bool pred_ok=prediction_is_admissible(
+                history,regions,tid,nb,local_side,level,N,mu,cfg,Pbound,scratch,
+                r.max_ratio,r.sum_ratio,r.ratio_samples,evaluated);
+            if constexpr (PROFILE_STATS_ENABLED) {
+                if (evaluated && !pred_ok) r.predict_rejected=true;
+            }
+            if (pred_ok) { r.action=Action::Predict; r.halo=scratch; return r; }
+        }
+
+        if (recompute_candidate)
+            return execute_recompute(false);
+
+        if (rec_ok) {
+            r.recompute_blocked_v2=true;
+            if (Cr >= wait_value) r.recompute_blocked_by_value=true;
+            else if (Cr_eff >= wait_value) r.recompute_blocked_by_progress=true;
+        }
     }
 
     const bool sample_wait = cost_model.sample_wait();
@@ -1012,7 +1065,8 @@ static void print_config(const Config& c, double mu) {
               << "Adaptive max lead: " << c.max_lead << '\n'
               << "Adaptive progress-aware: on\n"
               << "Adaptive progress lambda: " << c.progress_lambda << '\n'
-              << "Adaptive progress bootstrap samples: " << c.progress_bootstrap_samples << '\n'
+              << "Adaptive V2 progress bootstrap samples: " << c.progress_bootstrap_samples << '\n'
+              << "Adaptive V2 explore period: " << c.explore_period << '\n'
               << "Adaptive V2 phi-aware: " << (c.enable_phi?"on":"off") << '\n'
               << "Adaptive V2 online beta: " << c.online_beta << '\n'
               << "Adaptive V2 progress beta: " << c.progress_beta << '\n'
@@ -1184,17 +1238,23 @@ int main() {
             const double north_penalty=ws.north_progress.estimate_ticks(cfg.progress_bootstrap_samples);
             const double south_penalty=ws.south_progress.estimate_ticks(cfg.progress_bootstrap_samples);
             ResolveResult rn=resolve_halo(history,regions,progress,blocked_on,global_progress,wait_backend,tid,nt,Side::North,
-                step,N,mu,cfg,north_penalty,ws.north_cost,timer_overhead_ticks,
+                step,N,mu,cfg,north_penalty,ws.north_progress,ws.north_cost,timer_overhead_ticks,
                 ws.north_halo.data(),ws.Pnorth,ws.zero_line.data());
             ResolveResult rs=resolve_halo(history,regions,progress,blocked_on,global_progress,wait_backend,tid,nt,Side::South,
-                step,N,mu,cfg,south_penalty,ws.south_cost,timer_overhead_ticks,
+                step,N,mu,cfg,south_penalty,ws.south_progress,ws.south_cost,timer_overhead_ticks,
                 ws.south_halo.data(),ws.Psouth,ws.zero_line.data());
 
-            // Somente uma fracao dos bypasses arma medicao do lead-guard seguinte.
-            if (rn.action==Action::Recompute || rn.action==Action::Predict)
-                ws.north_progress.pending_sample = ws.north_progress.arm_sample();
-            if (rs.action==Action::Recompute || rs.action==Action::Predict)
-                ws.south_progress.pending_sample = ws.south_progress.arm_sample();
+            // Durante o bootstrap, TODO RECOMPUTE exploratorio produz uma amostra
+            // de C_progress no passo seguinte. Depois do bootstrap voltamos a amostragem
+            // esparsa configurada por HEAT2D_PROGRESS_SAMPLE_PERIOD.
+            if (rn.action==Action::Recompute || rn.action==Action::Predict) {
+                ws.north_progress.pending_sample = rn.v2_exploratory_recompute
+                    ? true : ws.north_progress.arm_sample();
+            }
+            if (rs.action==Action::Recompute || rs.action==Action::Predict) {
+                ws.south_progress.pending_sample = rs.v2_exploratory_recompute
+                    ? true : ws.south_progress.arm_sample();
+            }
 
             if constexpr (PROFILE_STATS_ENABLED) {
                 st.count(rn.action); st.count(rs.action);
@@ -1206,6 +1266,10 @@ int main() {
                 if (rs.recompute_blocked_by_value) ++st.recompute_blocked_value;
                 if (rn.recompute_blocked_v2) ++st.recompute_blocked_v2;
                 if (rs.recompute_blocked_v2) ++st.recompute_blocked_v2;
+                if (rn.v2_exploratory_recompute) ++st.v2_exploratory_recomputes;
+                if (rs.v2_exploratory_recompute) ++st.v2_exploratory_recomputes;
+                if (rn.v2_bootstrap_wait) ++st.v2_bootstrap_wait_decisions;
+                if (rs.v2_bootstrap_wait) ++st.v2_bootstrap_wait_decisions;
                 auto acc_v2=[&](const ResolveResult& x) {
                     if (!x.model_evaluated) return;
                     ++st.v2_model_evaluations;
@@ -1259,6 +1323,7 @@ int main() {
     if constexpr (PROFILE_STATS_ENABLED) {
         std::uint64_t rd=0,rc=0,pr=0,wt=0,lw=0,rj=0,sa=0,sr=0;
         std::uint64_t blocked_progress=0, blocked_value=0, blocked_v2=0, v2_evals=0, v2_cr_obs=0, v2_cw_obs=0;
+        std::uint64_t v2_exploratory=0, v2_bootstrap_waits=0;
         std::uint64_t v2_cr_ticks=0, v2_cw_ticks=0;
         long double v2_phi_sum=0.0L, v2_lhs_sum=0.0L, v2_rhs_sum=0.0L;
         double v2_phi_min=1.0, v2_phi_max=0.0;
@@ -1269,6 +1334,8 @@ int main() {
             blocked_progress+=s.recompute_blocked_progress;
             blocked_value+=s.recompute_blocked_value;
             blocked_v2+=s.recompute_blocked_v2;
+            v2_exploratory+=s.v2_exploratory_recomputes;
+            v2_bootstrap_waits+=s.v2_bootstrap_wait_decisions;
             v2_evals+=s.v2_model_evaluations;
             v2_phi_sum+=s.v2_phi_sum; v2_lhs_sum+=s.v2_lhs_sum; v2_rhs_sum+=s.v2_rhs_sum;
             if (s.v2_model_evaluations) {
@@ -1285,7 +1352,11 @@ int main() {
         }
         long double final_cr_sum=0.0L, final_cw_sum=0.0L, final_phi_sum=0.0L, final_cont_sum=0.0L;
         std::uint64_t model_cr_samples=0, model_cw_samples=0, model_phi_updates=0;
-        for (const ThreadWorkspace& w : workspace) {
+        std::uint64_t progress_ready_sides=0;
+        for (int t=0; t<ntmax; ++t) {
+            const ThreadWorkspace& w = workspace[static_cast<std::size_t>(t)];
+            if (t>0 && w.north_progress.ready(cfg.progress_bootstrap_samples)) ++progress_ready_sides;
+            if (t+1<ntmax && w.south_progress.ready(cfg.progress_bootstrap_samples)) ++progress_ready_sides;
             const OnlineSideModel* models[2] = {&w.north_cost, &w.south_cost};
             for (const OnlineSideModel* m : models) {
                 final_cr_sum += m->Cr_hat;
@@ -1308,6 +1379,8 @@ int main() {
                   << "Progress-blocked RECOMPUTE: " << blocked_progress << '\n'
                   << "V2 immediate-value blocked RECOMPUTE: " << blocked_value << '\n'
                   << "V2 RECOMPUTE rejected by model: " << blocked_v2 << '\n'
+                  << "V2 exploratory RECOMPUTE: " << v2_exploratory << '\n'
+                  << "V2 bootstrap WAIT decisions: " << v2_bootstrap_waits << '\n'
                   << "V2 model evaluations: " << v2_evals << '\n'
                   << std::setprecision(16)
                   << "V2 phi mean: " << (v2_evals?static_cast<double>(v2_phi_sum/static_cast<long double>(v2_evals)):0.0) << '\n'
@@ -1326,6 +1399,8 @@ int main() {
                   << "V2 model CR samples: " << model_cr_samples << '\n'
                   << "V2 model CW samples: " << model_cw_samples << '\n'
                   << "V2 model phi updates: " << model_phi_updates << '\n'
+                  << "V2 progress bootstrap ready sides: " << progress_ready_sides << '\n'
+                  << "V2 progress bootstrap total sides: " << (2 * std::max(0, ntmax - 1)) << '\n'
                   << "Progress penalty samples: " << penalty_samples << '\n'
                   << "Progress penalty nonzero samples: " << penalty_nonzero << '\n'
                   << std::setprecision(16)
