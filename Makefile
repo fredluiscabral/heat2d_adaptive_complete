@@ -29,6 +29,16 @@ SM_BASE_SRC := heat2d_explicit_omp_sem_nobarrier_nofs.cpp
 BW_BASE_BIN := heat2d_explicit_omp_busywait_nobarrier_nofs
 SM_BASE_BIN := heat2d_explicit_omp_sem_nobarrier_nofs
 
+
+# -----------------------------------------------------------------------------
+# WAIT critical-path oracle tracing (diagnostic only)
+# -----------------------------------------------------------------------------
+TRACE_HDR := heat2d_wait_trace.hpp
+BW_TRACE_SRC := heat2d_explicit_omp_busywait_nobarrier_nofs_wait_trace.cpp
+SM_TRACE_SRC := heat2d_explicit_omp_sem_nobarrier_nofs_wait_trace.cpp
+BW_TRACE_BIN := heat2d_wait_trace_busywait
+SM_TRACE_BIN := heat2d_wait_trace_semaphore
+
 # -----------------------------------------------------------------------------
 # Backend-specific WAIT calibration
 # -----------------------------------------------------------------------------
@@ -59,7 +69,7 @@ SM_V2_BIN := heat2d_adaptive_v2_sem
 BW_V2_PROF_BIN := heat2d_adaptive_v2_busywait_profile
 SM_V2_PROF_BIN := heat2d_adaptive_v2_sem_profile
 
-.PHONY: all current core baselines calibrators adaptive diagnostics profiles adaptive_v2 profiles_v2 clean
+.PHONY: all current core baselines calibrators adaptive diagnostics profiles adaptive_v2 profiles_v2 trace clean
 
 all: current baselines calibrators adaptive diagnostics adaptive_v2 profiles_v2
 
@@ -73,6 +83,7 @@ profiles: diagnostics
 core: baselines $(MPI_CAL_BIN) calibrators adaptive
 adaptive_v2: $(BW_V2_BIN) $(SM_V2_BIN)
 profiles_v2: $(BW_V2_PROF_BIN) $(SM_V2_PROF_BIN)
+trace: $(BW_TRACE_BIN) $(SM_TRACE_BIN)
 
 $(MPI_BASE_BIN): $(MPI_BASE_SRC) $(COMMON)
 	$(CXX) $(CXXFLAGS) $(MPI_BASE_SRC) -o $@ $(LDFLAGS)
@@ -97,6 +108,13 @@ $(BW_BASE_BIN): $(BW_BASE_SRC) $(COMMON)
 
 $(SM_BASE_BIN): $(SM_BASE_SRC) $(COMMON)
 	$(CXX) $(CXXFLAGS) $(SM_BASE_SRC) -o $@ $(LDFLAGS)
+
+
+$(BW_TRACE_BIN): $(BW_TRACE_SRC) $(TRACE_HDR) $(COMMON)
+	$(CXX) $(CXXFLAGS) $(BW_TRACE_SRC) -o $@ $(LDFLAGS)
+
+$(SM_TRACE_BIN): $(SM_TRACE_SRC) $(TRACE_HDR) $(COMMON)
+	$(CXX) $(CXXFLAGS) $(SM_TRACE_SRC) -o $@ $(LDFLAGS)
 
 $(BW_WCAL_BIN): $(BW_WCAL_SRC) $(COMMON)
 	$(CXX) $(CXXFLAGS) $(BW_WCAL_SRC) -o $@ $(LDFLAGS)
@@ -136,5 +154,6 @@ clean:
 	rm -f $(BW_BASE_BIN) $(SM_BASE_BIN) $(BW_WCAL_BIN) $(SM_WCAL_BIN) $(SM_WCAL_COMPAT_BIN)
 	rm -f $(BW_ADP_BIN) $(SM_ADP_BIN) $(BW_PROF_BIN) $(SM_PROF_BIN)
 	rm -f $(BW_V2_BIN) $(SM_V2_BIN) $(BW_V2_PROF_BIN) $(SM_V2_PROF_BIN)
+	rm -f $(BW_TRACE_BIN) $(SM_TRACE_BIN)
 	rm -f heat2d_cost_model.dat heat2d_wait_cost_busywait.dat heat2d_wait_cost_semaphore.dat
 	rm -f output.txt adaptive_stats.txt
